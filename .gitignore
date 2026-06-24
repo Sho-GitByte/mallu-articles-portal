@@ -1,0 +1,24 @@
+# --- Mallu Articles Portal ---
+
+# Local database (contains real candidate/firm data + uploaded resumes — never commit)
+mallu_articles.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Streamlit secrets (DB credentials etc. when we move to Postgres)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
