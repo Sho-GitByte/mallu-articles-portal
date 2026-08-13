@@ -46,6 +46,19 @@ The moment data needs to stick for real firms and students, swap SQLite for a fr
 **Postgres (Supabase)**. All DB access goes through a thin `q()` / `execute()` layer in
 `app.py`, so that swap is a small, contained change — not a rewrite.
 
+## Also in this repo — GharSe (Home Economy Marketplace)
+
+A second, independent Streamlit app: **`home_economy_app.py`** — a hyperlocal marketplace where
+verified women home entrepreneurs sell home-made food, handmade products and home-based services to
+their neighbourhood, with subscriptions, community pickup points and a transparent fee split.
+
+```bash
+streamlit run home_economy_app.py     # own DB (gharse.db), same admin/admin@123 bootstrap
+```
+
+The business case — model, unit economics, delivery math, Bengaluru pilot plan and risks — is in
+[`BLUEPRINT.md`](BLUEPRINT.md).
+
 ## Tech
 
 - Single-file **Streamlit** app (`app.py`)
