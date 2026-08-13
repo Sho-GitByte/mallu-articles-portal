@@ -72,7 +72,11 @@ BID_STATUSES = ["Offered", "Accepted", "Declined"]
 
 PLAN_PERIODS = [7, 15, 26, 30]
 
+PAYMENT_STATUSES = ["Unpaid", "Claimed", "Paid", "Refund due", "Refunded"]
+
 DEFAULT_SETTINGS = {
+    "platform_upi": "",          # the UPI ID customers pay into; set by admin before go-live
+    "brand_name": "GharSe",
     "commission_pct": "8",       # platform take on the item value
     "delivery_fee": "15",        # home delivery, per order
     "pickup_point_fee": "5",     # batched drop at a PG / office / apartment gate
@@ -168,6 +172,11 @@ def init_db():
             request_id INTEGER, provider_id INTEGER, price REAL, eta TEXT,
             note TEXT, status TEXT, created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER, amount REAL, orders_count INTEGER,
+            method TEXT, ref TEXT, note TEXT, created_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY, value TEXT
         );
@@ -188,8 +197,9 @@ def init_db():
 
 # Additive column migrations, so a database created by an earlier version keeps working.
 NEW_COLUMNS = {
-    "providers": {"photo": "BLOB"},
+    "providers": {"photo": "BLOB", "upi_id": "TEXT"},
     "listings": {"photo": "BLOB"},
+    "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT"},
 }
 
 def migrate():
@@ -258,6 +268,37 @@ def split_money(item_total, delivery_mode):
         "provider_payout": payout,
         "customer_total": round(item_total + delivery, 2),
     }
+
+def upi_link(amount, note):
+    """Deep link that opens GPay / PhonePe / Paytm on a phone with the amount filled in."""
+    pa = (setting("platform_upi", str) or "").strip()
+    if not pa:
+        return None
+    from urllib.parse import quote
+    brand = setting("brand_name", str) or "GharSe"
+    return (f"upi://pay?pa={quote(pa)}&pn={quote(brand)}&am={amount:.2f}"
+            f"&cu=INR&tn={quote(note[:40])}")
+
+def payout_due(provider_id):
+    """Escrow rule: money is releasable only once the order is delivered *and* paid for."""
+    earned = q(
+        "SELECT COALESCE(SUM(provider_payout),0) s, COUNT(*) c FROM orders "
+        "WHERE provider_id=? AND status='Delivered' AND payment_status='Paid'", (provider_id,)
+    )[0]
+    already = q("SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE provider_id=?", (provider_id,))[0]["s"]
+    return round((earned["s"] or 0) - (already or 0), 2), earned["c"]
+
+def cancel_order(o):
+    """Free the capacity back up, and flag money that now has to travel back."""
+    execute("UPDATE orders SET status='Cancelled' WHERE id=?", (o["id"],))
+    execute("UPDATE listings SET sold=MAX(0, sold-?) WHERE id=?", (o["qty"], o["listing_id"]))
+    if (o["payment_status"] or "Unpaid") in ("Claimed", "Paid"):
+        execute("UPDATE orders SET payment_status='Refund due' WHERE id=?", (o["id"],))
+
+def pay_pill(status):
+    status = status or "Unpaid"
+    cls = {"Paid": "ok", "Claimed": "", "Unpaid": "warn", "Refund due": "warn", "Refunded": ""}.get(status, "")
+    return f"<span class='pill {cls}'>{status}</span>"
 
 def authenticate(u, p):
     rows = q("SELECT * FROM users WHERE username=?", (u,))
@@ -479,7 +520,7 @@ def sidebar_nav(user):
         st.write("")
         role = user["role"]
         if role == "admin":
-            pages = ["Dashboard", "Home Entrepreneurs", "Listings", "Orders",
+            pages = ["Dashboard", "Home Entrepreneurs", "Listings", "Orders", "Payouts",
                      "Subscriptions", "Custom Requests", "Fees & Settings"]
         elif role == "provider":
             pages = ["My Profile & Verification", "My Listings", "Orders Received",
@@ -630,9 +671,42 @@ def admin_listings():
 def admin_orders():
     st.markdown("<div class='page-title'>Orders</div>"
                 "<div class='page-sub'>Full ledger with the fee split on every line.</div>", unsafe_allow_html=True)
+    todo = q(
+        "SELECT o.*, p.display_name provider, c.full_name customer, l.title item FROM orders o "
+        "JOIN providers p ON p.id=o.provider_id JOIN customers c ON c.id=o.customer_id "
+        "JOIN listings l ON l.id=o.listing_id WHERE o.payment_status IN ('Claimed','Refund due') ORDER BY o.id"
+    )
+    if todo:
+        st.markdown("#### Needs your confirmation")
+        for r in todo:
+            o = dict(r)
+            with st.container(border=True):
+                c = st.columns([3, 1, 1])
+                c[0].markdown(
+                    f"**#{o['id']} · {o['item']} × {o['qty']}**<br>"
+                    f"<span class='muted'>{o['customer']} → {o['provider']} · ref {o['payment_ref'] or '—'}</span>",
+                    unsafe_allow_html=True,
+                )
+                c[1].markdown(f"<div class='price'>{inr(o['customer_total'])}</div>", unsafe_allow_html=True)
+                c[2].markdown(pay_pill(o["payment_status"]), unsafe_allow_html=True)
+                if o["payment_status"] == "Claimed":
+                    b = st.columns([1, 1, 3])
+                    if b[0].button("Confirm received", key=f"conf{o['id']}", use_container_width=True):
+                        execute("UPDATE orders SET payment_status='Paid' WHERE id=?", (o["id"],))
+                        st.rerun()
+                    if b[1].button("Not received", key=f"nrec{o['id']}", use_container_width=True):
+                        execute("UPDATE orders SET payment_status='Unpaid', payment_ref=NULL WHERE id=?", (o["id"],))
+                        st.rerun()
+                else:
+                    if st.button("Mark refunded", key=f"refd{o['id']}"):
+                        execute("UPDATE orders SET payment_status='Refunded' WHERE id=?", (o["id"],))
+                        st.rerun()
+        st.divider()
+
     rows = q(
         "SELECT o.id, o.created_at, p.display_name provider, c.full_name customer, l.title item, "
-        "o.qty, o.customer_total, o.provider_payout, o.platform_fee, o.delivery_fee, o.delivery_mode, o.status "
+        "o.qty, o.customer_total, o.provider_payout, o.platform_fee, o.delivery_fee, o.delivery_mode, "
+        "o.status, o.payment_status, o.payment_ref "
         "FROM orders o JOIN providers p ON p.id=o.provider_id JOIN customers c ON c.id=o.customer_id "
         "JOIN listings l ON l.id=o.listing_id ORDER BY o.id DESC"
     )
@@ -672,11 +746,80 @@ def admin_requests():
         use_container_width=True, hide_index=True,
     )
 
+def admin_payouts():
+    st.markdown("<div class='page-title'>Payouts</div>"
+                "<div class='page-sub'>Money is held until an order is delivered and paid for — then it goes out.</div>",
+                unsafe_allow_html=True)
+    provs = q("SELECT * FROM providers ORDER BY display_name")
+    if not provs:
+        st.info("No home entrepreneurs yet.")
+        return
+
+    total_due = 0.0
+    pending = []
+    for r in provs:
+        p = dict(r)
+        due, cnt = payout_due(p["id"])
+        if due > 0.005:
+            pending.append((p, due, cnt))
+            total_due += due
+    c = st.columns(3)
+    kpi(c[0], "Owed right now", inr(total_due))
+    kpi(c[1], "Women awaiting payout", f"{len(pending)}")
+    kpi(c[2], "Paid out to date",
+        inr(q("SELECT COALESCE(SUM(amount),0) s FROM payouts")[0]["s"]))
+    st.write("")
+
+    if not pending:
+        st.success("Nothing outstanding — every delivered, paid order has been settled.")
+    for p, due, cnt in pending:
+        with st.container(border=True):
+            c = st.columns([3, 1])
+            c[0].markdown(
+                f"**{p['display_name']}** · {p['area'] or '—'}<br>"
+                f"<span class='muted'>{cnt} delivered & paid order(s) · UPI: "
+                f"{p['upi_id'] or 'NOT PROVIDED'}</span>",
+                unsafe_allow_html=True,
+            )
+            c[1].markdown(f"<div class='price'>{inr(due)}</div><span class='muted'>owed</span>",
+                          unsafe_allow_html=True)
+            if not (p["upi_id"] or "").strip():
+                st.caption("⚠️ No UPI ID on her profile — ask her to add one before paying.")
+            with st.form(f"po{p['id']}"):
+                fc = st.columns([1, 1, 2])
+                amount = fc[0].number_input("Amount (₹)", 0.0, float(due), float(due), step=1.0,
+                                            key=f"amt{p['id']}")
+                method = fc[1].selectbox("Method", ["UPI", "Bank transfer", "Cash"], key=f"m{p['id']}")
+                ref = fc[2].text_input("Transaction reference", key=f"r{p['id']}")
+                if st.form_submit_button("Record payout"):
+                    if amount <= 0:
+                        st.error("Enter an amount.")
+                    elif len(ref.strip()) < 4:
+                        st.error("Enter the transaction reference — this is the audit trail.")
+                    else:
+                        execute(
+                            "INSERT INTO payouts (provider_id, amount, orders_count, method, ref, created_at) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (p["id"], round(amount, 2), cnt, method, ref.strip(), datetime.utcnow().isoformat()),
+                        )
+                        st.success(f"Recorded {inr(amount)} to {p['display_name']}.")
+                        st.rerun()
+
+    st.markdown("#### Payout history")
+    hist = q("SELECT po.created_at, p.display_name provider, po.amount, po.orders_count, po.method, po.ref "
+             "FROM payouts po JOIN providers p ON p.id=po.provider_id ORDER BY po.id DESC")
+    if hist:
+        st.dataframe(df(hist), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No payouts recorded yet.")
+
 def admin_settings():
     st.markdown("<div class='page-title'>Fees & Settings</div>"
                 "<div class='page-sub'>Change these and every price breakdown in the app updates.</div>",
                 unsafe_allow_html=True)
     with st.form("settings"):
+        upi = st.text_input("Platform UPI ID — customers pay into this", setting("platform_upi", str),
+                            placeholder="gharse@okaxis")
         c = st.columns(2)
         comm = c[0].number_input("Platform commission (% of item value)", 0.0, 30.0,
                                  setting("commission_pct", float), step=0.5)
@@ -687,6 +830,7 @@ def admin_settings():
                                  setting("pickup_point_fee", float), step=1.0)
         sfee = c[2].number_input("Self pickup fee (₹)", 0.0, 100.0, setting("self_pickup_fee", float), step=1.0)
         if st.form_submit_button("Save settings", use_container_width=True):
+            set_setting("platform_upi", upi.strip())
             set_setting("commission_pct", comm)
             set_setting("min_order", mino)
             set_setting("delivery_fee", dfee)
@@ -695,6 +839,14 @@ def admin_settings():
             st.success("Saved.")
             st.rerun()
 
+    st.markdown("#### How money moves today")
+    st.caption(
+        "Customers pay into the platform UPI ID and enter the reference; you confirm it under **Orders**; "
+        "the cook's share is released under **Payouts** once the order is delivered. That is a real, "
+        "auditable escrow with no gateway account needed — which is how a 25-kitchen pilot should start. "
+        "Swap in a payment gateway (Razorpay/Cashfree) for auto-reconciliation once volume makes manual "
+        "confirmation the bottleneck; the split, escrow rule and payout ledger stay exactly as they are."
+    )
     st.markdown("#### Why commission is capped low")
     st.caption(
         "A ₹100 meal cannot carry a 25–30% take rate and still pay the woman who cooked it. "
@@ -763,13 +915,17 @@ def provider_profile(user):
         langs = c[1].multiselect("Languages you speak", LANGUAGES, default=csv_split(p.get("languages")))
         diet = st.selectbox("Kitchen type", DIETS, index=idx(DIETS, p.get("diet")))
         bio = st.text_area("Tell customers about your cooking / craft", p.get("bio") or "", height=90)
-        fssai = st.text_input("FSSAI registration number (required to sell food)", p.get("fssai_no") or "")
+        c = st.columns(2)
+        fssai = c[0].text_input("FSSAI registration number (required to sell food)", p.get("fssai_no") or "")
+        upi = c[1].text_input("Your UPI ID — this is where your earnings are sent", p.get("upi_id") or "",
+                              placeholder="name@okhdfcbank")
         if st.form_submit_button("Save profile", use_container_width=True):
             execute(
                 "UPDATE providers SET display_name=?, owner_name=?, phone=?, email=?, pincode=?, area=?, "
-                "radius_km=?, kinds=?, categories=?, cuisines=?, languages=?, diet=?, bio=?, fssai_no=? WHERE id=?",
+                "radius_km=?, kinds=?, categories=?, cuisines=?, languages=?, diet=?, bio=?, fssai_no=?, "
+                "upi_id=? WHERE id=?",
                 (display_name, owner_name, phone, email, pincode, area, radius, csv_join(kinds), csv_join(cats),
-                 csv_join(cuis), csv_join(langs), diet, bio, fssai.strip(), p["id"]),
+                 csv_join(cuis), csv_join(langs), diet, bio, fssai.strip(), upi.strip(), p["id"]),
             )
             st.success("Profile saved.")
             st.rerun()
@@ -904,7 +1060,10 @@ def provider_orders(user):
             )
             c[1].markdown(f"<div class='price'>{inr(o['provider_payout'])}</div><span class='muted'>you get</span>",
                           unsafe_allow_html=True)
-            c[2].markdown(f"<span class='pill'>{o['status']}</span>", unsafe_allow_html=True)
+            c[2].markdown(f"<span class='pill'>{o['status']}</span> {pay_pill(o['payment_status'])}",
+                          unsafe_allow_html=True)
+            if (o["payment_status"] or "Unpaid") == "Unpaid" and o["status"] == "Placed":
+                st.caption("Not paid for yet — wait for payment before you start cooking.")
             if o["status"] not in ("Delivered", "Cancelled"):
                 nxt = ORDER_FLOW[min(ORDER_FLOW.index(o["status"]) + 1, len(ORDER_FLOW) - 1)]
                 b = st.columns([1, 1, 3])
@@ -912,8 +1071,7 @@ def provider_orders(user):
                     execute("UPDATE orders SET status=? WHERE id=?", (nxt, o["id"]))
                     st.rerun()
                 if b[1].button("Cancel", key=f"can{o['id']}", use_container_width=True):
-                    execute("UPDATE orders SET status='Cancelled' WHERE id=?", (o["id"],))
-                    execute("UPDATE listings SET sold=MAX(0, sold-?) WHERE id=?", (o["qty"], o["listing_id"]))
+                    cancel_order(o)
                     st.rerun()
             if o["rating"]:
                 st.caption(f"⭐ {o['rating']}/5 — {o['review'] or 'no comment'}")
@@ -1030,17 +1188,32 @@ def provider_earnings(user):
                 "WHERE provider_id=? AND status NOT IN ('Delivered','Cancelled')", (p["id"],))[0]["s"]
     fees = q("SELECT COALESCE(SUM(platform_fee),0) s FROM orders WHERE provider_id=? AND status='Delivered'",
              (p["id"],))[0]["s"]
-    subs = q("SELECT COALESCE(SUM(price),0) s FROM subscriptions WHERE provider_id=? AND status='Active'",
-             (p["id"],))[0]["s"]
+    paid_out = q("SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE provider_id=?", (p["id"],))[0]["s"]
+    due, due_orders = payout_due(p["id"])
     c = st.columns(4)
     kpi(c[0], "Earned (delivered)", inr(delivered["s"]))
-    kpi(c[1], "In progress", inr(pending))
-    kpi(c[2], "Subscriptions booked", inr(subs))
-    kpi(c[3], "Platform fee paid", inr(fees))
+    kpi(c[1], "Paid out to you", inr(paid_out))
+    kpi(c[2], "Awaiting payout", inr(due))
+    kpi(c[3], "In progress", inr(pending))
     st.write("")
+    st.caption(
+        f"Payout covers {due_orders} delivered order(s) that the customer has actually paid for — "
+        f"money is held until delivery. Platform fee so far: {inr(fees)}."
+    )
+    if not (p.get("upi_id") or "").strip():
+        st.warning("Add your UPI ID under **My Profile & Verification** — payouts can't be sent without it.")
+
+    payouts = q("SELECT * FROM payouts WHERE provider_id=? ORDER BY id DESC", (p["id"],))
+    if payouts:
+        st.markdown("#### Payouts received")
+        st.dataframe(df(payouts)[["created_at", "amount", "orders_count", "method", "ref"]],
+                     use_container_width=True, hide_index=True)
+
+    st.markdown("#### Every order")
     rows = q(
-        "SELECT o.created_at, l.title, o.qty, o.customer_total, o.platform_fee, o.provider_payout, o.status "
-        "FROM orders o JOIN listings l ON l.id=o.listing_id WHERE o.provider_id=? ORDER BY o.id DESC", (p["id"],)
+        "SELECT o.created_at, l.title, o.qty, o.customer_total, o.platform_fee, o.provider_payout, "
+        "o.status, o.payment_status FROM orders o JOIN listings l ON l.id=o.listing_id "
+        "WHERE o.provider_id=? ORDER BY o.id DESC", (p["id"],)
     )
     if rows:
         st.dataframe(df(rows), use_container_width=True, hide_index=True)
@@ -1140,13 +1313,13 @@ def customer_discover(user):
                     execute(
                         "INSERT INTO orders (listing_id, provider_id, customer_id, qty, item_total, delivery_fee, "
                         "platform_fee, provider_payout, customer_total, delivery_mode, note, status, for_date, "
-                        "slot, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'Placed', ?,?,?)",
+                        "slot, payment_status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'Placed', ?,?, 'Unpaid', ?)",
                         (l["id"], l["provider_id"], cust["id"], int(qty), s["item_total"], s["delivery_fee"],
                          s["platform_fee"], s["provider_payout"], s["customer_total"], mode, note,
                          l["avail_date"], l["slot"], datetime.utcnow().isoformat()),
                     )
                     execute("UPDATE listings SET sold=sold+? WHERE id=?", (int(qty), l["id"]))
-                    st.success("Order placed. You'll see it under My Orders.")
+                    st.success("Order placed. Pay for it under My Orders — the kitchen starts cooking once it's paid.")
                     st.rerun()
 
     st.markdown("### Meal plans near you")
@@ -1215,11 +1388,37 @@ def customer_orders(user):
                 unsafe_allow_html=True,
             )
             c[1].markdown(f"<div class='price'>{inr(o['customer_total'])}</div>", unsafe_allow_html=True)
-            c[2].markdown(f"<span class='pill'>{o['status']}</span>", unsafe_allow_html=True)
+            c[2].markdown(f"<span class='pill'>{o['status']}</span> {pay_pill(o['payment_status'])}",
+                          unsafe_allow_html=True)
             st.markdown(money_split_caption({
                 "customer_total": o["customer_total"], "provider_payout": o["provider_payout"],
                 "delivery_fee": o["delivery_fee"], "platform_fee": o["platform_fee"],
             }), unsafe_allow_html=True)
+
+            if (o["payment_status"] or "Unpaid") == "Unpaid" and o["status"] != "Cancelled":
+                link = upi_link(o["customer_total"], f"GharSe order {o['id']}")
+                pa = (setting("platform_upi", str) or "").strip()
+                if link:
+                    st.link_button(f"Pay {inr(o['customer_total'])} by UPI", link, use_container_width=True)
+                    st.caption(f"Or send it to **{pa}** from any UPI app, then enter the reference below.")
+                else:
+                    st.caption("Payment isn't switched on yet — admin needs to add the platform UPI ID "
+                               "under Fees & Settings.")
+                with st.form(f"pay{o['id']}"):
+                    pc = st.columns([3, 1])
+                    ref = pc[0].text_input("UPI reference / UTR number", key=f"utr{o['id']}")
+                    if pc[1].form_submit_button("I've paid"):
+                        if len(ref.strip()) < 6:
+                            st.error("Enter the reference number your UPI app showed after payment.")
+                        else:
+                            execute("UPDATE orders SET payment_status='Claimed', payment_ref=?, paid_at=? "
+                                    "WHERE id=?", (ref.strip(), datetime.utcnow().isoformat(), o["id"]))
+                            st.success("Thanks — the team will confirm it shortly.")
+                            st.rerun()
+            elif o["payment_status"] == "Claimed":
+                st.caption(f"Payment reference {o['payment_ref']} — awaiting confirmation.")
+            elif o["payment_status"] == "Refund due":
+                st.caption("Cancelled after payment — your refund is being processed.")
             if o["status"] == "Delivered" and not o["rating"]:
                 with st.form(f"rate{o['id']}"):
                     rc = st.columns([1, 3, 1])
@@ -1230,8 +1429,7 @@ def customer_orders(user):
                         st.rerun()
             if o["status"] == "Placed":
                 if st.button("Cancel order", key=f"cc{o['id']}"):
-                    execute("UPDATE orders SET status='Cancelled' WHERE id=?", (o["id"],))
-                    execute("UPDATE listings SET sold=MAX(0, sold-?) WHERE id=?", (o["qty"], o["listing_id"]))
+                    cancel_order(o)
                     st.rerun()
 
 def customer_subscriptions(user):
@@ -1374,8 +1572,8 @@ def dispatch(user, page):
     if role == "admin":
         {
             "Dashboard": admin_dashboard, "Home Entrepreneurs": admin_providers, "Listings": admin_listings,
-            "Orders": admin_orders, "Subscriptions": admin_subscriptions, "Custom Requests": admin_requests,
-            "Fees & Settings": admin_settings,
+            "Orders": admin_orders, "Payouts": admin_payouts, "Subscriptions": admin_subscriptions,
+            "Custom Requests": admin_requests, "Fees & Settings": admin_settings,
         }[page]()
     elif role == "provider":
         {
