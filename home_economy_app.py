@@ -172,6 +172,11 @@ def init_db():
             request_id INTEGER, provider_id INTEGER, price REAL, eta TEXT,
             note TEXT, status TEXT, created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            to_phone TEXT, to_name TEXT, to_role TEXT, kind TEXT, body TEXT,
+            order_id INTEGER, status TEXT, error TEXT, sent_at TEXT, created_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS payouts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_id INTEGER, amount REAL, orders_count INTEGER,
@@ -299,6 +304,75 @@ def pay_pill(status):
     status = status or "Unpaid"
     cls = {"Paid": "ok", "Claimed": "", "Unpaid": "warn", "Refund due": "warn", "Refunded": ""}.get(status, "")
     return f"<span class='pill {cls}'>{status}</span>"
+
+# ----------------------------------------------------------------------------- WHATSAPP
+# Two delivery paths. With Cloud API credentials in the environment, messages send
+# themselves. Without them — which is where a pilot starts — every message is queued
+# and sent by one click from the Outbox, which needs no Meta account at all.
+def wa_number(phone):
+    d = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(d) == 10:
+        d = "91" + d
+    return d if len(d) >= 11 else ""
+
+def wa_link(phone, body):
+    from urllib.parse import quote
+    n = wa_number(phone)
+    return f"https://wa.me/{n}?text={quote(body)}" if n else None
+
+def wa_credentials():
+    import os
+    tok, phone_id = os.environ.get("WHATSAPP_TOKEN"), os.environ.get("WHATSAPP_PHONE_ID")
+    if not (tok and phone_id):
+        try:
+            tok = tok or st.secrets.get("WHATSAPP_TOKEN")
+            phone_id = phone_id or st.secrets.get("WHATSAPP_PHONE_ID")
+        except Exception:
+            pass
+    return tok, phone_id
+
+def send_whatsapp(phone, body):
+    """Returns (sent, error). Business-initiated messages outside the 24-hour customer
+    service window need an approved template — the API error is stored, not hidden."""
+    tok, phone_id = wa_credentials()
+    n = wa_number(phone)
+    if not (tok and phone_id):
+        return False, "no API credentials — send from the Outbox"
+    if not n:
+        return False, "no usable phone number"
+    try:
+        import requests
+        r = requests.post(
+            f"https://graph.facebook.com/v20.0/{phone_id}/messages",
+            headers={"Authorization": f"Bearer {tok}"},
+            json={"messaging_product": "whatsapp", "to": n, "type": "text", "text": {"body": body}},
+            timeout=15,
+        )
+        if r.status_code < 300:
+            return True, None
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, str(e)[:200]
+
+def notify(phone, name, role, kind, body, order_id=None):
+    now = datetime.utcnow().isoformat()
+    sent, err = send_whatsapp(phone, body)
+    execute(
+        "INSERT INTO notifications (to_phone, to_name, to_role, kind, body, order_id, status, error, "
+        "sent_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (phone, name, role, kind, body, order_id, "Sent" if sent else "Queued", err,
+         now if sent else None, now),
+    )
+
+def notify_provider(provider_id, kind, body, order_id=None):
+    rows = q("SELECT display_name, phone FROM providers WHERE id=?", (provider_id,))
+    if rows:
+        notify(rows[0]["phone"], rows[0]["display_name"], "provider", kind, body, order_id)
+
+def notify_customer(customer_id, kind, body, order_id=None):
+    rows = q("SELECT full_name, phone FROM customers WHERE id=?", (customer_id,))
+    if rows:
+        notify(rows[0]["phone"], rows[0]["full_name"], "customer", kind, body, order_id)
 
 def authenticate(u, p):
     rows = q("SELECT * FROM users WHERE username=?", (u,))
@@ -521,7 +595,7 @@ def sidebar_nav(user):
         role = user["role"]
         if role == "admin":
             pages = ["Dashboard", "Home Entrepreneurs", "Listings", "Orders", "Payouts",
-                     "Subscriptions", "Custom Requests", "Fees & Settings"]
+                     "Subscriptions", "Custom Requests", "WhatsApp Outbox", "Fees & Settings"]
         elif role == "provider":
             pages = ["My Profile & Verification", "My Listings", "Orders Received",
                      "Meal Plans & Subscribers", "Open Requests", "My Earnings"]
@@ -693,6 +767,10 @@ def admin_orders():
                     b = st.columns([1, 1, 3])
                     if b[0].button("Confirm received", key=f"conf{o['id']}", use_container_width=True):
                         execute("UPDATE orders SET payment_status='Paid' WHERE id=?", (o["id"],))
+                        notify_provider(o["provider_id"], "paid",
+                                        f"Order #{o['id']} ({o['qty']} × {o['item']}) is paid for. "
+                                        f"You can start cooking — {inr(o['provider_payout'])} is yours "
+                                        f"once it's delivered.", o["id"])
                         st.rerun()
                     if b[1].button("Not received", key=f"nrec{o['id']}", use_container_width=True):
                         execute("UPDATE orders SET payment_status='Unpaid', payment_ref=NULL WHERE id=?", (o["id"],))
@@ -802,6 +880,9 @@ def admin_payouts():
                             "VALUES (?,?,?,?,?,?)",
                             (p["id"], round(amount, 2), cnt, method, ref.strip(), datetime.utcnow().isoformat()),
                         )
+                        notify_provider(p["id"], "payout",
+                                        f"{inr(amount)} has been sent to you for {cnt} delivered order(s). "
+                                        f"{method} reference {ref.strip()}.")
                         st.success(f"Recorded {inr(amount)} to {p['display_name']}.")
                         st.rerun()
 
@@ -812,6 +893,60 @@ def admin_payouts():
         st.dataframe(df(hist), use_container_width=True, hide_index=True)
     else:
         st.caption("No payouts recorded yet.")
+
+def admin_outbox():
+    st.markdown("<div class='page-title'>WhatsApp Outbox</div>"
+                "<div class='page-sub'>Every message the app wants to send. One tap each — no Meta account needed.</div>",
+                unsafe_allow_html=True)
+    tok, phone_id = wa_credentials()
+    if tok and phone_id:
+        st.success("Cloud API credentials found — messages send automatically. Anything that failed stays here.")
+    else:
+        st.info("No Cloud API credentials set (`WHATSAPP_TOKEN`, `WHATSAPP_PHONE_ID`). Messages queue here and "
+                "you send them with one tap, which is exactly how a 25-kitchen pilot should run.")
+
+    queued = q("SELECT * FROM notifications WHERE status='Queued' ORDER BY id")
+    n_sent = q("SELECT COUNT(*) c FROM notifications WHERE status='Sent'")[0]["c"]
+    n_all = q("SELECT COUNT(*) c FROM notifications")[0]["c"]
+    c = st.columns(3)
+    kpi(c[0], "Waiting to send", f"{len(queued)}")
+    kpi(c[1], "Sent", f"{n_sent}")
+    kpi(c[2], "Total messages", f"{n_all}")
+    st.write("")
+
+    if not queued:
+        st.success("Nothing waiting.")
+    for r in queued:
+        n = dict(r)
+        with st.container(border=True):
+            st.markdown(
+                f"**{n['to_name'] or 'Unknown'}** · {n['to_role']} · {n['to_phone'] or 'no phone'} "
+                f"<span class='pill'>{n['kind']}</span><br><span class='muted'>{n['body']}</span>"
+                + (f"<br><span class='muted'>Last error: {n['error']}</span>" if n["error"] else ""),
+                unsafe_allow_html=True,
+            )
+            b = st.columns([1, 1, 2])
+            link = wa_link(n["to_phone"], n["body"])
+            if link:
+                b[0].link_button("Open WhatsApp", link, use_container_width=True)
+            else:
+                b[0].caption("No valid phone number on file.")
+            if b[1].button("Mark sent", key=f"ms{n['id']}", use_container_width=True):
+                execute("UPDATE notifications SET status='Sent', sent_at=? WHERE id=?",
+                        (datetime.utcnow().isoformat(), n["id"]))
+                st.rerun()
+            if tok and phone_id and b[2].button("Retry via API", key=f"rt{n['id']}"):
+                ok, err = send_whatsapp(n["to_phone"], n["body"])
+                execute("UPDATE notifications SET status=?, error=?, sent_at=? WHERE id=?",
+                        ("Sent" if ok else "Queued", err, datetime.utcnow().isoformat() if ok else None, n["id"]))
+                st.rerun()
+
+    st.markdown("#### Message history")
+    hist = q("SELECT created_at, to_name, to_role, kind, status, body FROM notifications ORDER BY id DESC LIMIT 200")
+    if hist:
+        st.dataframe(df(hist), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Nothing yet.")
 
 def admin_settings():
     st.markdown("<div class='page-title'>Fees & Settings</div>"
@@ -1069,9 +1204,22 @@ def provider_orders(user):
                 b = st.columns([1, 1, 3])
                 if b[0].button(f"Mark {nxt}", key=f"adv{o['id']}", use_container_width=True):
                     execute("UPDATE orders SET status=? WHERE id=?", (nxt, o["id"]))
+                    line = {
+                        "Accepted": "has been accepted by the kitchen",
+                        "Preparing": "is being cooked now",
+                        "Ready": "is ready",
+                        "Out for delivery": "is on its way",
+                        "Delivered": "has been delivered — enjoy, and do rate it in the app",
+                    }.get(nxt, f"is now {nxt}")
+                    notify_customer(o["customer_id"], "status",
+                                    f"Your GharSe order #{o['id']} ({o['title']}) {line}.", o["id"])
                     st.rerun()
                 if b[1].button("Cancel", key=f"can{o['id']}", use_container_width=True):
                     cancel_order(o)
+                    notify_customer(o["customer_id"], "cancelled",
+                                    f"Sorry — order #{o['id']} ({o['title']}) was cancelled by the kitchen."
+                                    + (" Your refund is being processed."
+                                       if (o["payment_status"] or "") in ("Claimed", "Paid") else ""), o["id"])
                     st.rerun()
             if o["rating"]:
                 st.caption(f"⭐ {o['rating']}/5 — {o['review'] or 'no comment'}")
@@ -1174,6 +1322,9 @@ def provider_requests(user):
                                 "VALUES (?,?,?,?,?, 'Offered', ?)",
                                 (req["id"], p["id"], price, eta, note, datetime.utcnow().isoformat()),
                             )
+                            notify_customer(req["customer_id"], "new_bid",
+                                            f"{p['display_name']} has offered {inr(price)} for your request "
+                                            f"\"{req['title']}\". Open GharSe to accept or compare offers.")
                             st.success("Offer sent.")
                             st.rerun()
 
@@ -1319,6 +1470,20 @@ def customer_discover(user):
                          l["avail_date"], l["slot"], datetime.utcnow().isoformat()),
                     )
                     execute("UPDATE listings SET sold=sold+? WHERE id=?", (int(qty), l["id"]))
+                    oid = q("SELECT MAX(id) m FROM orders")[0]["m"]
+                    notify_provider(
+                        l["provider_id"], "new_order",
+                        f"New order #{oid} on GharSe: {qty} × {l['title']} for {l['avail_date']}, "
+                        f"{l['slot']}. {mode}."
+                        + (f" Note: {note}." if note else "")
+                        + f" You'll get {inr(s['provider_payout'])}. We'll confirm once the customer has paid.",
+                        oid,
+                    )
+                    notify_customer(
+                        cust["id"], "order_placed",
+                        f"Order #{oid} placed with {l['display_name']}: {qty} × {l['title']}. "
+                        f"Pay {inr(s['customer_total'])} in the app to confirm it.", oid,
+                    )
                     st.success("Order placed. Pay for it under My Orders — the kitchen starts cooking once it's paid.")
                     st.rerun()
 
@@ -1357,6 +1522,10 @@ def customer_discover(user):
                         (pl["id"], pl["provider_id"], cust["id"], start.isoformat(), pl["days"], pl["price"],
                          mode, prefs, datetime.utcnow().isoformat()),
                     )
+                    notify_provider(pl["provider_id"], "new_subscription",
+                                    f"New subscriber on GharSe: {cust.get('full_name') or 'a customer'} took "
+                                    f"\"{pl['title']}\" ({pl['days']} days, {pl['slot']}) from {start.isoformat()}. "
+                                    f"{mode}. Preferences — {prefs}.")
                     st.success("Subscribed. Your preferences were sent to the kitchen.")
                     st.rerun()
 
@@ -1524,6 +1693,10 @@ def customer_requests(user):
                         execute("UPDATE bids SET status='Accepted' WHERE id=?", (b["id"],))
                         execute("UPDATE bids SET status='Declined' WHERE request_id=? AND id!=?", (req["id"], b["id"]))
                         execute("UPDATE requests SET status='Assigned' WHERE id=?", (req["id"],))
+                        notify_provider(b["provider_id"], "bid_accepted",
+                                        f"Your offer of {inr(b['price'])} for \"{req['title']}\" was accepted by "
+                                        f"{cust.get('full_name') or 'a customer'} in {req['area']}. "
+                                        f"Needed by {req['needed_by']}.")
                         st.rerun()
                 else:
                     bc[2].markdown(f"<span class='pill'>{b['status']}</span>", unsafe_allow_html=True)
@@ -1573,7 +1746,8 @@ def dispatch(user, page):
         {
             "Dashboard": admin_dashboard, "Home Entrepreneurs": admin_providers, "Listings": admin_listings,
             "Orders": admin_orders, "Payouts": admin_payouts, "Subscriptions": admin_subscriptions,
-            "Custom Requests": admin_requests, "Fees & Settings": admin_settings,
+            "Custom Requests": admin_requests, "WhatsApp Outbox": admin_outbox,
+            "Fees & Settings": admin_settings,
         }[page]()
     elif role == "provider":
         {
