@@ -444,6 +444,57 @@ def repeat_customers(pid):
 def df(rows):
     return pd.DataFrame([dict(r) for r in rows])
 
+def short_dt(v):
+    try:
+        return datetime.fromisoformat(str(v)).strftime("%d %b, %H:%M")
+    except (TypeError, ValueError):
+        return str(v)
+
+def table(rows, cols=None, money=(), empty="Nothing yet."):
+    """Render as HTML so the table follows this app's theme, not Streamlit's own."""
+    from html import escape
+    data = [dict(r) for r in rows]
+    if not data:
+        st.caption(empty)
+        return
+    cols = cols or list(data[0].keys())
+    head = "".join(f"<th>{escape(c.replace('_', ' '))}</th>" for c in cols)
+    body = ""
+    for d in data:
+        cells = ""
+        for c in cols:
+            v = d.get(c)
+            if v is None or v == "":
+                cells += "<td class='muted'>—</td>"
+            elif c in money:
+                cells += f"<td class='num'>{inr(v)}</td>"
+            elif c.endswith("_at"):
+                cells += f"<td>{escape(short_dt(v))}</td>"
+            elif isinstance(v, bool):
+                cells += f"<td>{'yes' if v else 'no'}</td>"
+            elif isinstance(v, (int, float)):
+                cells += f"<td class='num'>{v:g}</td>"
+            else:
+                cells += f"<td>{escape(str(v))}</td>"
+        body += f"<tr>{cells}</tr>"
+    st.markdown(f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
+                f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
+
+def hbar(rows, label_key, value_key, empty="No data yet."):
+    from html import escape
+    data = [dict(r) for r in rows]
+    if not data:
+        st.caption(empty)
+        return
+    top = max((d[value_key] or 0) for d in data) or 1
+    html = ""
+    for d in data:
+        v = d[value_key] or 0
+        html += (f"<div class='hb'><div class='hb-l'>{escape(str(d[label_key]))}</div>"
+                 f"<div class='hb-t'><div class='hb-f' style='width:{100 * v / top:.1f}%'></div></div>"
+                 f"<div class='hb-v'>{v:g}</div></div>")
+    st.markdown(html, unsafe_allow_html=True)
+
 MAX_IMG_MB = 5
 
 def process_image(uploaded, max_px=900):
@@ -500,19 +551,92 @@ def inject_css():
         h1,h2,h3,h4,h5,h6, p, span, label, div { color: var(--txt); }
         .block-container { padding-top: 1.4rem; }
 
-        .stTextInput input, .stNumberInput input, .stTextArea textarea, .stDateInput input,
+        /* The app header sits above everything and ships white — paint it out. */
+        header[data-testid="stHeader"] { background:transparent !important; }
+        [data-testid="stToolbar"] { display:none !important; }
+
+        .stTextInput input, .stTextArea textarea, .stDateInput input,
         div[data-baseweb="select"] > div {
             background:#1b1409 !important; color:var(--txt) !important;
             border:1px solid var(--line) !important; border-radius:10px !important;
         }
         .stTextInput input:focus, .stTextArea textarea:focus { border-color:var(--amber) !important; }
 
-        .stButton>button, .stDownloadButton>button, .stForm button[kind="primaryFormSubmit"] {
+        /* Current Streamlit builds render selects, number inputs and toggles through
+           react-aria rather than baseweb, so these need their own rules. */
+        [data-testid="stSelectbox"] div[role="group"],
+        [data-testid="stMultiSelect"] div[role="group"],
+        [data-testid="stNumberInputContainer"],
+        [data-testid="stDateInput"] div[role="group"] {
+            background:#1b1409 !important; border:1px solid var(--line) !important;
+            border-radius:10px !important; color:var(--txt) !important;
+        }
+        [data-testid="stSelectbox"] input, [data-testid="stMultiSelect"] input,
+        [data-testid="stNumberInputField"], [data-testid="stDateInput"] input {
+            background:transparent !important; color:var(--txt) !important; border:0 !important;
+        }
+        [data-testid="stSelectbox"] div[role="group"]:focus-within,
+        [data-testid="stNumberInputContainer"]:focus-within { border-color:var(--amber) !important; }
+        [data-testid="stNumberInputStepUp"], [data-testid="stNumberInputStepDown"] {
+            background:#241a0c !important; color:var(--amber2) !important; border:0 !important;
+        }
+        /* Dropdown menus render in a portal, outside .stApp */
+        .react-aria-Popover, [role="listbox"], [data-testid="stSelectboxVirtualDropdown"] {
+            background:#171008 !important; border:1px solid var(--line) !important; color:var(--txt) !important;
+        }
+        [role="option"] { color:var(--txt) !important; }
+        [role="option"][data-focused="true"], [role="option"]:hover {
+            background:rgba(255,166,43,.16) !important;
+        }
+        /* Checkbox / radio marks default to Streamlit red; make them the brand amber */
+        [data-testid="stCheckbox"] label[data-selected="true"] div:has(> svg),
+        [data-testid="stCheckbox"] label[data-checked="true"] div:has(> svg) {
+            background:var(--amber) !important; border-color:var(--amber) !important;
+        }
+        [data-testid="stCheckbox"] label div:has(> svg) svg polyline { stroke:#20160a !important; }
+        /* Radio: the dot is label > div > div > div:first-child, with the fill inside it */
+        [data-testid="stRadioOption"] { background:transparent !important; }
+        [data-testid="stRadioOption"] > div > div > div:first-child {
+            background:#241a0c !important; border-color:var(--line) !important;
+        }
+        [data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child {
+            border-color:var(--amber) !important;
+        }
+        [data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child > div {
+            background:var(--amber) !important;
+        }
+        /* Streamlit's heading anchor-link icons */
+        [data-testid="stHeaderActionElements"] { display:none !important; }
+        /* The text input's border lives on the wrapper, not the input */
+        [data-testid="stTextInputRootElement"] {
+            background:#1b1409 !important; border:1px solid var(--line) !important; border-radius:10px !important;
+        }
+        [data-testid="stTextInputRootElement"]:focus-within { border-color:var(--amber) !important; }
+        [data-testid="stTextInputRootElement"] input { background:transparent !important; border:0 !important; }
+
+        .stButton>button, .stDownloadButton>button, .stForm button[kind="primaryFormSubmit"],
+        [data-testid="stFormSubmitButton"] button, [data-testid="stBaseButton-secondary"],
+        [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-secondaryFormSubmit"],
+        [data-testid="stBaseButton-primaryFormSubmit"] {
             background: linear-gradient(135deg, #f08b1d 0%, #ffa62b 100%);
             color:#20160a; border:0; border-radius:10px; font-weight:700;
             box-shadow:0 6px 18px rgba(255,166,43,0.22); transition:.15s;
         }
         .stButton>button:hover, .stDownloadButton>button:hover { filter:brightness(1.08); transform:translateY(-1px); }
+
+        /* Link buttons are anchors, not buttons, and ship unstyled */
+        [data-testid="stLinkButton"] a, [data-testid="stBaseLinkButton-secondary"],
+        [data-testid="stBaseLinkButton-primary"] {
+            background: linear-gradient(135deg, #f08b1d 0%, #ffa62b 100%) !important;
+            border:0 !important; border-radius:10px !important; font-weight:700 !important;
+            box-shadow:0 6px 18px rgba(255,166,43,0.22);
+        }
+        /* Streamlit paints the label in a nested element, so set it there too */
+        .stButton button p, .stButton button div, [data-testid="stFormSubmitButton"] button p,
+        [data-testid="stLinkButton"] a p, [data-testid="stLinkButton"] a div,
+        [data-testid="stBaseButton-secondary"] p, [data-testid="stBaseButton-primary"] p {
+            color:#20160a !important; font-weight:700 !important;
+        }
 
         div[data-testid="stVerticalBlockBorderWrapper"] {
             background: var(--panel); border:1px solid var(--line) !important;
@@ -540,6 +664,24 @@ def inject_css():
         .price { font-size:1.5rem; font-weight:800; color:#fff; }
         .save { color:var(--mint); font-weight:700; font-size:.85rem; }
         .muted { color:#c2a883; font-size:.85rem; }
+
+        /* Tables and bars are rendered as HTML so they follow this theme instead of
+           Streamlit's own light one. */
+        .tbl-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px;
+                    background:rgba(255,255,255,.03); }
+        table.tbl { border-collapse:collapse; width:100%; font-size:.86rem; }
+        table.tbl th, table.tbl td { text-align:left; padding:9px 14px;
+                    border-bottom:1px solid rgba(255,166,43,.12); white-space:nowrap; }
+        table.tbl th { font-size:.68rem; letter-spacing:.1em; text-transform:uppercase;
+                    color:#c2a883; background:rgba(255,166,43,.06); font-weight:600; }
+        table.tbl tbody tr:last-child td { border-bottom:0; }
+        table.tbl td.num { text-align:right; font-variant-numeric:tabular-nums; }
+        .hb { display:grid; grid-template-columns:130px 1fr 46px; gap:12px; align-items:center;
+              margin-bottom:9px; }
+        .hb-l { font-size:.84rem; color:#c2a883; overflow:hidden; text-overflow:ellipsis; }
+        .hb-t { background:rgba(255,166,43,.08); border-radius:999px; height:14px; overflow:hidden; }
+        .hb-f { background:linear-gradient(90deg,#f08b1d,#ffc46b); height:100%; border-radius:999px; }
+        .hb-v { font-size:.84rem; font-variant-numeric:tabular-nums; text-align:right; }
         .split { font-size:.8rem; color:#c2a883; border-top:1px dashed var(--line); margin-top:8px; padding-top:6px; }
         #MainMenu, footer {visibility:hidden;}
         </style>
@@ -698,14 +840,14 @@ def admin_dashboard():
             "WHERE o.status!='Cancelled' GROUP BY p.area ORDER BY orders DESC"
         )
         if rows:
-            st.bar_chart(df(rows).set_index("area"))
+            hbar(rows, "area", "orders")
         else:
             st.caption("No orders yet.")
     with right:
         st.markdown("**Listings by kind**")
         rows = q("SELECT kind, COUNT(*) listings FROM listings GROUP BY kind")
         if rows:
-            st.bar_chart(df(rows).set_index("kind"))
+            hbar(rows, "kind", "listings")
         else:
             st.caption("No listings yet.")
 
@@ -778,9 +920,8 @@ def admin_listings():
     if not rows:
         st.info("No listings yet.")
         return
-    d = df(rows)[["id", "display_name", "area", "kind", "category", "title", "price", "unit",
-                  "avail_date", "capacity", "sold", "active"]]
-    st.dataframe(d, use_container_width=True, hide_index=True)
+    table(rows, ["id", "display_name", "area", "kind", "category", "title", "price", "unit",
+                 "avail_date", "capacity", "sold", "active"], money=("price",))
 
 def admin_orders():
     st.markdown("<div class='page-title'>Orders</div>"
@@ -831,7 +972,7 @@ def admin_orders():
     if not rows:
         st.info("No orders yet.")
         return
-    st.dataframe(df(rows), use_container_width=True, hide_index=True)
+    table(rows, money=("customer_total", "provider_payout", "platform_fee", "ops_fee", "delivery_fee"))
 
 def admin_subscriptions():
     st.markdown("<div class='page-title'>Subscriptions</div>"
@@ -846,7 +987,7 @@ def admin_subscriptions():
     if not rows:
         st.info("No subscriptions yet.")
         return
-    st.dataframe(df(rows), use_container_width=True, hide_index=True)
+    table(rows, money=("price",))
 
 def admin_requests():
     st.markdown("<div class='page-title'>Custom Requests</div>"
@@ -859,10 +1000,8 @@ def admin_requests():
     if not rows:
         st.info("No requests posted yet.")
         return
-    st.dataframe(
-        df(rows)[["id", "customer", "kind", "category", "title", "area", "budget", "needed_by", "bids", "status"]],
-        use_container_width=True, hide_index=True,
-    )
+    table(rows, ["id", "customer", "kind", "category", "title", "area", "budget", "needed_by", "bids", "status"],
+          money=("budget",))
 
 def admin_payouts():
     st.markdown("<div class='page-title'>Payouts</div>"
@@ -929,10 +1068,7 @@ def admin_payouts():
     st.markdown("#### Payout history")
     hist = q("SELECT po.created_at, p.display_name provider, po.amount, po.orders_count, po.method, po.ref "
              "FROM payouts po JOIN providers p ON p.id=po.provider_id ORDER BY po.id DESC")
-    if hist:
-        st.dataframe(df(hist), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No payouts recorded yet.")
+    table(hist, money=("amount",), empty="No payouts recorded yet.")
 
 def admin_price_policy():
     st.markdown("<div class='page-title'>Price Guidance</div>"
@@ -985,7 +1121,7 @@ def admin_price_policy():
         "OR (b.max_price IS NOT NULL AND l.price > b.max_price)) ORDER BY p.display_name"
     )
     if rows:
-        st.dataframe(df(rows), use_container_width=True, hide_index=True)
+        table(rows, money=("price", "cost_price", "min_price", "max_price"))
         st.caption("Worth a call — either the price is wrong, or the guidance is.")
     else:
         st.caption("Every live listing sits inside its range.")
@@ -995,7 +1131,7 @@ def admin_price_policy():
               "AND l.price < l.cost_price")
     if below:
         st.markdown("#### ⚠️ Selling below cost")
-        st.dataframe(df(below), use_container_width=True, hide_index=True)
+        table(below, money=("price", "cost_price"))
         st.caption("Call these women today. A seller losing money on every order quits within weeks.")
 
 def admin_outbox():
@@ -1047,10 +1183,7 @@ def admin_outbox():
 
     st.markdown("#### Message history")
     hist = q("SELECT created_at, to_name, to_role, kind, status, body FROM notifications ORDER BY id DESC LIMIT 200")
-    if hist:
-        st.dataframe(df(hist), use_container_width=True, hide_index=True)
-    else:
-        st.caption("Nothing yet.")
+    table(hist, empty="Nothing yet.")
 
 def admin_settings():
     st.markdown("<div class='page-title'>Fees & Settings</div>"
@@ -1486,19 +1619,17 @@ def provider_earnings(user):
     payouts = q("SELECT * FROM payouts WHERE provider_id=? ORDER BY id DESC", (p["id"],))
     if payouts:
         st.markdown("#### Payouts received")
-        st.dataframe(df(payouts)[["created_at", "amount", "orders_count", "method", "ref"]],
-                     use_container_width=True, hide_index=True)
+        table(payouts, ["created_at", "amount", "orders_count", "method", "ref"], money=("amount",))
 
     st.markdown("#### Every order")
     rows = q(
-        "SELECT o.created_at, l.title, o.qty, o.customer_total, o.platform_fee, o.provider_payout, "
-        "o.status, o.payment_status FROM orders o JOIN listings l ON l.id=o.listing_id "
-        "WHERE o.provider_id=? ORDER BY o.id DESC", (p["id"],)
+        "SELECT o.created_at, l.title, o.qty, o.customer_total, o.delivery_fee, o.platform_fee, "
+        "o.ops_fee, o.provider_payout, o.status, o.payment_status FROM orders o "
+        "JOIN listings l ON l.id=o.listing_id WHERE o.provider_id=? ORDER BY o.id DESC", (p["id"],)
     )
-    if rows:
-        st.dataframe(df(rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No orders yet.")
+    table(rows, money=("customer_total", "delivery_fee", "platform_fee", "ops_fee", "provider_payout"),
+          empty="No orders yet.")
+    st.caption("Each row adds up: customer total = your payout + delivery + platform + processing.")
 
 # ----------------------------------------------------------------------------- CUSTOMER PAGES
 def customer_discover(user):
