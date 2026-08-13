@@ -75,23 +75,34 @@ entered by the seller — so the saving is visible where it is real, and absent 
 
 ## 5. Unit economics (illustrative, at the app's default settings)
 
-Defaults shipped in the MVP: **8%** platform commission on item value, **₹15** home delivery,
-**₹5** community pickup point, **₹0** self pickup.
+Defaults shipped in the MVP: **10%** commission on item value — split as **8% platform**
+(onboarding, verification, the app) and **2% processing & support** (gateway charges, the team's
+coordination) — plus **₹15** home delivery, **₹5** community pickup point, **₹0** self pickup.
+
+Both lines are shown separately to both sides. One blended number invites the question "what am I
+paying for?"; two named ones answer it.
 
 One ₹85 meal, delivered to a PG pickup point:
 
 | Line | Amount |
 |------|--------|
 | Customer pays | **₹90** |
-| Home entrepreneur receives | **₹78.20** |
-| Platform commission (8%) | ₹6.80 |
+| Home entrepreneur receives | **₹76.50** |
+| Platform fee (8%) | ₹6.80 |
+| Processing & support (2%) | ₹1.70 |
 | Delivery | ₹5.00 |
 
 Her day, cooking 20 meals at ₹85, with ingredients and gas at roughly ₹50/meal:
 
-- Revenue to her: 20 × ₹78.20 = **₹1,564**
+- Revenue to her: 20 × ₹76.50 = **₹1,530**
 - Cost of goods: 20 × ₹50 = ₹1,000
-- Contribution: **₹564/day** → roughly **₹14,000 over 25 days**, from one meal slot
+- Contribution: **₹530/day** → roughly **₹13,250 over 25 days**, from one meal slot
+
+**Why 10% and not 30%.** Commission has to be judged against her *margin*, not her price. A
+restaurant prices at 3–4× food cost and survives a 25% take; a home cook prices at ~1.6×, so a ₹85
+meal carries about ₹33 of margin. A 30% commission takes ₹25.50 of it — roughly 77% of her profit,
+leaving ₹7.50 a meal. She would quit within weeks, and she would be right to. Ten percent is not
+generosity; it is the rate at which supply survives.
 
 Two slots, or higher-margin custom and festival orders, move that materially. These are
 illustrative figures for planning, not an earnings promise — publishing guaranteed-income numbers is
@@ -113,7 +124,7 @@ pickup points. Never one meal, nine kilometres.
 
 | Stream | When | Note |
 |--------|------|------|
-| Commission (5–12%) | Day 1 | Deliberately thin — a ₹100 meal cannot carry a 30% take rate |
+| Commission — 8% platform + 2% processing | Day 1 | Deliberately thin — a ₹100 meal cannot carry a 30% take rate |
 | Delivery fee | Day 1 | Should approach cost, not profit, until density exists |
 | Customer meal subscriptions | Phase 1 | The compounding one |
 | Seller Pro (₹99 / ₹199 / ₹499 per month) | Phase 2 | Photos, priority placement, analytics |
@@ -144,8 +155,12 @@ has an FSSAI number on file. Products and services publish immediately.
 Indian gig-work regulation is moving, and Karnataka is actively building a platform-worker welfare
 framework. Rather than defend a take rate later, build the position now:
 
-- Commission capped low and shown on every single order, to both sides
+- Commission capped at 10% and itemised on every single order, to both sides
 - The customer sees exactly what reached the cook
+- **Price guidance, not haggling.** Daily meal prices are fixed and transparent; the team sets a
+  fair range per category in the admin, and the app warns a seller who prices outside it — or below
+  her own cost. Bidding stays only where price is genuinely bespoke: custom, bulk and festival
+  orders. Haggling over a ₹90 lunch costs both sides more than it moves, and only the cook loses
 - The admin dashboard reports "% of GMV that reached the women" as a headline KPI
 
 A platform that empowers customers by squeezing the women it claims to serve has no story worth

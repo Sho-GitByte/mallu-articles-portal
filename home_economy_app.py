@@ -77,7 +77,9 @@ PAYMENT_STATUSES = ["Unpaid", "Claimed", "Paid", "Refund due", "Refunded"]
 DEFAULT_SETTINGS = {
     "platform_upi": "",          # the UPI ID customers pay into; set by admin before go-live
     "brand_name": "GharSe",
-    "commission_pct": "8",       # platform take on the item value
+    "platform_pct": "8",         # onboarding, verification, the app itself
+    "ops_pct": "2",              # payment processing, support, coordination
+    "commission_pct": "8",       # legacy single rate; kept so old databases still read
     "delivery_fee": "15",        # home delivery, per order
     "pickup_point_fee": "5",     # batched drop at a PG / office / apartment gate
     "self_pickup_fee": "0",
@@ -172,6 +174,10 @@ def init_db():
             request_id INTEGER, provider_id INTEGER, price REAL, eta TEXT,
             note TEXT, status TEXT, created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS price_bands (
+            category TEXT PRIMARY KEY, kind TEXT, min_price REAL, max_price REAL,
+            note TEXT, updated_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             to_phone TEXT, to_name TEXT, to_role TEXT, kind TEXT, body TEXT,
@@ -203,8 +209,9 @@ def init_db():
 # Additive column migrations, so a database created by an earlier version keeps working.
 NEW_COLUMNS = {
     "providers": {"photo": "BLOB", "upi_id": "TEXT"},
-    "listings": {"photo": "BLOB"},
-    "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT"},
+    "listings": {"photo": "BLOB", "cost_price": "REAL"},
+    "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT",
+               "ops_fee": "REAL DEFAULT 0"},
 }
 
 def migrate():
@@ -262,14 +269,22 @@ def delivery_fee_for(mode):
     }.get(mode, setting("delivery_fee", float))
 
 def split_money(item_total, delivery_mode):
-    """The one place fees are computed. Every screen shows this same breakdown."""
+    """The one place fees are computed. Every screen shows this same breakdown.
+
+    The commission is two named parts, not one blended number:
+      platform_fee — onboarding, verification, the app itself
+      ops_fee      — payment processing, support, the team's coordination
+    """
     delivery = delivery_fee_for(delivery_mode)
-    platform = round(item_total * setting("commission_pct", float) / 100.0, 2)
-    payout = round(item_total - platform, 2)
+    platform = round(item_total * setting("platform_pct", float) / 100.0, 2)
+    ops = round(item_total * setting("ops_pct", float) / 100.0, 2)
+    payout = round(item_total - platform - ops, 2)
     return {
         "item_total": round(item_total, 2),
         "delivery_fee": delivery,
         "platform_fee": platform,
+        "ops_fee": ops,
+        "commission": round(platform + ops, 2),
         "provider_payout": payout,
         "customer_total": round(item_total + delivery, 2),
     }
@@ -299,6 +314,28 @@ def cancel_order(o):
     execute("UPDATE listings SET sold=MAX(0, sold-?) WHERE id=?", (o["qty"], o["listing_id"]))
     if (o["payment_status"] or "Unpaid") in ("Claimed", "Paid"):
         execute("UPDATE orders SET payment_status='Refund due' WHERE id=?", (o["id"],))
+
+def price_band(category):
+    rows = q("SELECT * FROM price_bands WHERE category=?", (category,))
+    return dict(rows[0]) if rows else None
+
+def price_verdict(category, price, cost=None):
+    """The team's reasonable-price policy, applied by the app instead of by phone.
+    Returns (level, message) where level is 'ok' | 'warn' | 'bad' | None."""
+    if cost and price < cost:
+        return "bad", f"This is below what it costs you to make ({inr(cost)}). You'd lose money on every order."
+    if cost and price < cost * 1.15:
+        return "warn", f"Only {inr(price - cost)} left after your cost of {inr(cost)} — price it a little higher."
+    b = price_band(category)
+    if not b:
+        return None, None
+    lo, hi = b["min_price"], b["max_price"]
+    if lo and price < lo:
+        return "warn", f"Below the usual {inr(lo)}–{inr(hi)} for {category} in this area. Fine if you meant it."
+    if hi and price > hi:
+        return "warn", (f"Above the usual {inr(lo)}–{inr(hi)} for {category}. Customers may skip it unless the "
+                        f"description explains why it's worth more.")
+    return "ok", f"In the fair range for {category} ({inr(lo)}–{inr(hi)})."
 
 def pay_pill(status):
     status = status or "Unpaid"
@@ -520,7 +557,9 @@ def money_split_caption(s):
     return (
         f"<div class='split'>Customer pays <b>{inr(s['customer_total'])}</b> &nbsp;·&nbsp; "
         f"Home entrepreneur gets <b>{inr(s['provider_payout'])}</b> &nbsp;·&nbsp; "
-        f"Delivery {inr(s['delivery_fee'])} &nbsp;·&nbsp; Platform {inr(s['platform_fee'])}</div>"
+        f"Delivery {inr(s['delivery_fee'])} &nbsp;·&nbsp; "
+        f"Platform {inr(s['platform_fee'])} &nbsp;·&nbsp; "
+        f"Processing &amp; support {inr(s.get('ops_fee', 0))}</div>"
     )
 
 # ----------------------------------------------------------------------------- AUTH VIEWS
@@ -594,7 +633,7 @@ def sidebar_nav(user):
         st.write("")
         role = user["role"]
         if role == "admin":
-            pages = ["Dashboard", "Home Entrepreneurs", "Listings", "Orders", "Payouts",
+            pages = ["Dashboard", "Home Entrepreneurs", "Listings", "Price Guidance", "Orders", "Payouts",
                      "Subscriptions", "Custom Requests", "WhatsApp Outbox", "Fees & Settings"]
         elif role == "provider":
             pages = ["My Profile & Verification", "My Listings", "Orders Received",
@@ -625,7 +664,8 @@ def admin_dashboard():
     n_orders = q("SELECT COUNT(*) c FROM orders WHERE status!='Cancelled'")[0]["c"]
     gmv = q("SELECT COALESCE(SUM(customer_total),0) s FROM orders WHERE status='Delivered'")[0]["s"]
     payout = q("SELECT COALESCE(SUM(provider_payout),0) s FROM orders WHERE status='Delivered'")[0]["s"]
-    take = q("SELECT COALESCE(SUM(platform_fee),0) s FROM orders WHERE status='Delivered'")[0]["s"]
+    take = q("SELECT COALESCE(SUM(platform_fee),0) + COALESCE(SUM(ops_fee),0) s FROM orders "
+             "WHERE status='Delivered'")[0]["s"]
     n_subs = q("SELECT COUNT(*) c FROM subscriptions WHERE status='Active'")[0]["c"]
 
     c = st.columns(4)
@@ -894,6 +934,70 @@ def admin_payouts():
     else:
         st.caption("No payouts recorded yet.")
 
+def admin_price_policy():
+    st.markdown("<div class='page-title'>Price Guidance</div>"
+                "<div class='page-sub'>The team's reasonable-price policy, written once here instead of "
+                "explained on every call.</div>", unsafe_allow_html=True)
+    st.caption(
+        "Set the range a category should normally sit in. Sellers see it while pricing, and get a warning "
+        "when they go outside it — or below their own cost. Nothing is blocked; this is guidance, not a cage."
+    )
+    kind = st.selectbox("Category group", KINDS)
+    with st.form(f"bands{kind}"):
+        rows = {}
+        for cat in CATEGORIES[kind]:
+            b = price_band(cat) or {}
+            c = st.columns([2, 1, 1, 2])
+            c[0].markdown(f"**{cat}**")
+            lo = c[1].number_input("Min ₹", 0.0, 100000.0, float(b.get("min_price") or 0), step=5.0,
+                                   key=f"lo{cat}", label_visibility="collapsed")
+            hi = c[2].number_input("Max ₹", 0.0, 100000.0, float(b.get("max_price") or 0), step=5.0,
+                                   key=f"hi{cat}", label_visibility="collapsed")
+            note = c[3].text_input("Note", b.get("note") or "", key=f"nt{cat}", label_visibility="collapsed",
+                                   placeholder="optional note to the seller")
+            rows[cat] = (lo, hi, note)
+        if st.form_submit_button("Save guidance", use_container_width=True):
+            bad = [c for c, (lo, hi, _) in rows.items() if lo and hi and lo > hi]
+            if bad:
+                st.error(f"Minimum is above maximum for: {', '.join(bad)}")
+            else:
+                for cat, (lo, hi, note) in rows.items():
+                    if lo or hi or note:
+                        execute(
+                            "INSERT INTO price_bands (category, kind, min_price, max_price, note, updated_at) "
+                            "VALUES (?,?,?,?,?,?) ON CONFLICT(category) DO UPDATE SET "
+                            "kind=excluded.kind, min_price=excluded.min_price, max_price=excluded.max_price, "
+                            "note=excluded.note, updated_at=excluded.updated_at",
+                            (cat, kind, lo or None, hi or None, note.strip() or None,
+                             datetime.utcnow().isoformat()),
+                        )
+                    else:
+                        execute("DELETE FROM price_bands WHERE category=?", (cat,))
+                st.success("Guidance saved.")
+                st.rerun()
+
+    st.markdown("#### Listings priced outside guidance")
+    rows = q(
+        "SELECT l.title, l.category, l.price, l.cost_price, p.display_name, b.min_price, b.max_price "
+        "FROM listings l JOIN providers p ON p.id=l.provider_id "
+        "JOIN price_bands b ON b.category=l.category "
+        "WHERE l.active=1 AND ((b.min_price IS NOT NULL AND l.price < b.min_price) "
+        "OR (b.max_price IS NOT NULL AND l.price > b.max_price)) ORDER BY p.display_name"
+    )
+    if rows:
+        st.dataframe(df(rows), use_container_width=True, hide_index=True)
+        st.caption("Worth a call — either the price is wrong, or the guidance is.")
+    else:
+        st.caption("Every live listing sits inside its range.")
+
+    below = q("SELECT l.title, l.price, l.cost_price, p.display_name FROM listings l "
+              "JOIN providers p ON p.id=l.provider_id WHERE l.active=1 AND l.cost_price IS NOT NULL "
+              "AND l.price < l.cost_price")
+    if below:
+        st.markdown("#### ⚠️ Selling below cost")
+        st.dataframe(df(below), use_container_width=True, hide_index=True)
+        st.caption("Call these women today. A seller losing money on every order quits within weeks.")
+
 def admin_outbox():
     st.markdown("<div class='page-title'>WhatsApp Outbox</div>"
                 "<div class='page-sub'>Every message the app wants to send. One tap each — no Meta account needed.</div>",
@@ -955,10 +1059,14 @@ def admin_settings():
     with st.form("settings"):
         upi = st.text_input("Platform UPI ID — customers pay into this", setting("platform_upi", str),
                             placeholder="gharse@okaxis")
-        c = st.columns(2)
-        comm = c[0].number_input("Platform commission (% of item value)", 0.0, 30.0,
-                                 setting("commission_pct", float), step=0.5)
-        mino = c[1].number_input("Minimum order value (₹)", 0.0, 500.0, setting("min_order", float), step=10.0)
+        c = st.columns(3)
+        plat = c[0].number_input("Platform fee (%)", 0.0, 30.0, setting("platform_pct", float), step=0.5,
+                                 help="Onboarding, verification, the app itself.")
+        ops = c[1].number_input("Processing & support (%)", 0.0, 30.0, setting("ops_pct", float), step=0.5,
+                                help="Payment gateway charges, support, the team's coordination.")
+        mino = c[2].number_input("Minimum order value (₹)", 0.0, 500.0, setting("min_order", float), step=10.0)
+        st.caption(f"Total commission **{plat + ops:.1f}%** — on a ₹100 item the cook keeps "
+                   f"{inr(100 - plat - ops)}, you keep {inr(plat + ops)} before delivery costs.")
         c = st.columns(3)
         dfee = c[0].number_input("Home delivery fee (₹)", 0.0, 100.0, setting("delivery_fee", float), step=1.0)
         pfee = c[1].number_input("Community pickup point fee (₹)", 0.0, 100.0,
@@ -966,7 +1074,8 @@ def admin_settings():
         sfee = c[2].number_input("Self pickup fee (₹)", 0.0, 100.0, setting("self_pickup_fee", float), step=1.0)
         if st.form_submit_button("Save settings", use_container_width=True):
             set_setting("platform_upi", upi.strip())
-            set_setting("commission_pct", comm)
+            set_setting("platform_pct", plat)
+            set_setting("ops_pct", ops)
             set_setting("min_order", mino)
             set_setting("delivery_fee", dfee)
             set_setting("pickup_point_fee", pfee)
@@ -982,11 +1091,13 @@ def admin_settings():
         "Swap in a payment gateway (Razorpay/Cashfree) for auto-reconciliation once volume makes manual "
         "confirmation the bottleneck; the split, escrow rule and payout ledger stay exactly as they are."
     )
-    st.markdown("#### Why commission is capped low")
+    st.markdown("#### Why commission is capped at 10%")
     st.caption(
-        "A ₹100 meal cannot carry a 25–30% take rate and still pay the woman who cooked it. "
-        "The model here is thin commission + delivery + (later) seller subscriptions and corporate contracts — "
-        "not squeezing the supply side the platform exists to empower."
+        "A home cook prices at roughly 1.6× her cost, so a ₹85 meal carries about ₹33 of margin. "
+        "A 30% commission would take ₹25.50 of that — around 77% of her profit — and she would quit, "
+        "correctly. At 10% she keeps ₹24.50 a meal, and the platform still earns on every order. "
+        "Growth comes from subscriptions, corporate contracts and seller plans, not from a fatter cut "
+        "of a ₹90 lunch."
     )
     st.markdown("#### Change admin password")
     with st.form("pw"):
@@ -1089,16 +1200,34 @@ def provider_listings(user):
                    "Products and services can be listed right away.")
 
     with st.expander("➕ Add a listing", expanded=False):
+        # Outside a form, so the price check below reacts as she types.
+        kind = st.selectbox("Type", KINDS, key="nl_kind")
+        c = st.columns(2)
+        category = c[0].selectbox("Category", CATEGORIES[kind], key="nl_cat")
+        band = price_band(category)
+        if band and (band["min_price"] or band["max_price"]):
+            c[1].caption(f"💡 Usual range here: **{inr(band['min_price'])}–{inr(band['max_price'])}**"
+                         + (f" · {band['note']}" if band["note"] else ""))
+        c = st.columns(3)
+        price = c[0].number_input("Your price (₹)", 0.0, 100000.0, 0.0, step=5.0, key="nl_price")
+        cost = c[1].number_input("What it costs you to make (₹)", 0.0, 100000.0, 0.0, step=5.0, key="nl_cost",
+                                 help="Ingredients + gas + packaging. Only you and the team see this.")
+        market = c[2].number_input("Typical shop/restaurant price (₹)", 0.0, 100000.0, 0.0, step=5.0, key="nl_mkt")
+        if price > 0:
+            level, msg = price_verdict(category, price, cost or None)
+            if level == "bad":
+                st.error(msg)
+            elif level == "warn":
+                st.warning(msg)
+            elif level == "ok":
+                st.success(msg)
+            if cost and price > cost:
+                st.caption(f"You keep {inr(split_money(price, 'Self pickup')['provider_payout'] - cost)} per unit "
+                           f"after our 10% and your cost.")
         with st.form("newlisting", clear_on_submit=True):
-            kind = st.selectbox("Type", KINDS)
-            c = st.columns(2)
-            category = c[0].selectbox("Category", CATEGORIES[kind])
-            title = c[1].text_input("Title (e.g. Chicken Dum Biryani)")
+            title = st.text_input("Title (e.g. Chicken Dum Biryani)")
             desc = st.text_area("What's in it?", height=80)
-            c = st.columns(3)
-            price = c[0].number_input("Your price (₹)", 0.0, 100000.0, 0.0, step=5.0)
-            unit = c[1].selectbox("Unit", UNITS)
-            market = c[2].number_input("Typical shop/restaurant price (₹, optional)", 0.0, 100000.0, 0.0, step=5.0)
+            unit = st.selectbox("Unit", UNITS)
             c = st.columns(3)
             avail = c[0].date_input("Available on", date.today())
             slot = c[1].selectbox("Slot", SLOTS)
@@ -1116,11 +1245,11 @@ def provider_listings(user):
                     active = 1 if (kind != "Food" or food_ok) else 0
                     execute(
                         "INSERT INTO listings (provider_id, kind, category, title, description, cuisine, diet, "
-                        "price, unit, market_price, avail_date, slot, capacity, sold, active, photo, created_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
+                        "price, unit, cost_price, market_price, avail_date, slot, capacity, sold, active, photo, "
+                        "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
                         (p["id"], kind, category, title, desc, None if cuisine == "—" else cuisine, diet,
-                         price, unit, market or None, avail.isoformat(), slot, int(capacity), active,
-                         process_image(shot), datetime.utcnow().isoformat()),
+                         price, unit, cost or None, market or None, avail.isoformat(), slot, int(capacity),
+                         active, process_image(shot), datetime.utcnow().isoformat()),
                     )
                     st.success("Listing added." if active else "Saved, but held unpublished until verification.")
                     st.rerun()
@@ -1337,8 +1466,8 @@ def provider_earnings(user):
                   "WHERE provider_id=? AND status='Delivered'", (p["id"],))[0]
     pending = q("SELECT COALESCE(SUM(provider_payout),0) s FROM orders "
                 "WHERE provider_id=? AND status NOT IN ('Delivered','Cancelled')", (p["id"],))[0]["s"]
-    fees = q("SELECT COALESCE(SUM(platform_fee),0) s FROM orders WHERE provider_id=? AND status='Delivered'",
-             (p["id"],))[0]["s"]
+    fees = q("SELECT COALESCE(SUM(platform_fee),0) + COALESCE(SUM(ops_fee),0) s FROM orders "
+             "WHERE provider_id=? AND status='Delivered'", (p["id"],))[0]["s"]
     paid_out = q("SELECT COALESCE(SUM(amount),0) s FROM payouts WHERE provider_id=?", (p["id"],))[0]["s"]
     due, due_orders = payout_due(p["id"])
     c = st.columns(4)
@@ -1463,10 +1592,11 @@ def customer_discover(user):
                 else:
                     execute(
                         "INSERT INTO orders (listing_id, provider_id, customer_id, qty, item_total, delivery_fee, "
-                        "platform_fee, provider_payout, customer_total, delivery_mode, note, status, for_date, "
-                        "slot, payment_status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'Placed', ?,?, 'Unpaid', ?)",
+                        "platform_fee, ops_fee, provider_payout, customer_total, delivery_mode, note, status, "
+                        "for_date, slot, payment_status, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'Placed', ?,?, 'Unpaid', ?)",
                         (l["id"], l["provider_id"], cust["id"], int(qty), s["item_total"], s["delivery_fee"],
-                         s["platform_fee"], s["provider_payout"], s["customer_total"], mode, note,
+                         s["platform_fee"], s["ops_fee"], s["provider_payout"], s["customer_total"], mode, note,
                          l["avail_date"], l["slot"], datetime.utcnow().isoformat()),
                     )
                     execute("UPDATE listings SET sold=sold+? WHERE id=?", (int(qty), l["id"]))
@@ -1562,6 +1692,7 @@ def customer_orders(user):
             st.markdown(money_split_caption({
                 "customer_total": o["customer_total"], "provider_payout": o["provider_payout"],
                 "delivery_fee": o["delivery_fee"], "platform_fee": o["platform_fee"],
+                "ops_fee": o["ops_fee"] or 0,
             }), unsafe_allow_html=True)
 
             if (o["payment_status"] or "Unpaid") == "Unpaid" and o["status"] != "Cancelled":
@@ -1745,6 +1876,7 @@ def dispatch(user, page):
     if role == "admin":
         {
             "Dashboard": admin_dashboard, "Home Entrepreneurs": admin_providers, "Listings": admin_listings,
+            "Price Guidance": admin_price_policy,
             "Orders": admin_orders, "Payouts": admin_payouts, "Subscriptions": admin_subscriptions,
             "Custom Requests": admin_requests, "WhatsApp Outbox": admin_outbox,
             "Fees & Settings": admin_settings,

@@ -53,13 +53,14 @@ print(f"photo pipeline ... ok  {len(raw) // 1024}KB PNG -> {len(small) // 1024}K
 
 s = hea.split_money(85 * 2, "Community pickup point")
 assert s["customer_total"] == 175.0, s
-assert s["provider_payout"] == 156.4, s
-assert round(s["platform_fee"] + s["provider_payout"], 2) == s["item_total"], s
+assert (s["platform_fee"], s["ops_fee"]) == (13.6, 3.4), s
+assert s["provider_payout"] == 153.0, s
+assert round(s["platform_fee"] + s["ops_fee"] + s["provider_payout"], 2) == s["item_total"], s
 oid = hea.execute(
     "INSERT INTO orders (listing_id, provider_id, customer_id, qty, item_total, delivery_fee, platform_fee, "
-    "provider_payout, customer_total, delivery_mode, note, status, for_date, slot, created_at) "
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?, 'Delivered', ?,?,?)",
-    (lid, pid, cid, 2, s["item_total"], s["delivery_fee"], s["platform_fee"], s["provider_payout"],
+    "ops_fee, provider_payout, customer_total, delivery_mode, note, status, for_date, slot, created_at) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'Delivered', ?,?,?)",
+    (lid, pid, cid, 2, s["item_total"], s["delivery_fee"], s["platform_fee"], s["ops_fee"], s["provider_payout"],
      s["customer_total"], "Community pickup point", "less oil", date.today().isoformat(), hea.SLOTS[1], now))
 hea.execute("UPDATE listings SET sold=2 WHERE id=?", (lid,))
 hea.execute("INSERT INTO subscriptions (plan_id, provider_id, customer_id, start_date, days, price, delivery_mode, "
@@ -79,13 +80,25 @@ hea.execute("UPDATE orders SET payment_status='Paid', payment_ref='UTR11223344' 
 link = hea.upi_link(175.0, "GharSe order 1")
 assert link.startswith("upi://pay?pa=gharse%40okaxis") and "am=175.00" in link and "cu=INR" in link, link
 due, cnt = hea.payout_due(pid)
-assert (due, cnt) == (156.4, 1), (due, cnt)
+assert (due, cnt) == (153.0, 1), (due, cnt)
 print("upi link ......... ok ", link[:58] + "…")
+
+# price policy: guidance band + her own cost, applied by the app instead of by phone
+hea.execute("INSERT INTO price_bands (category, kind, min_price, max_price, note, updated_at) "
+            "VALUES (?,?,?,?,?,?)", ("Daily Meal (Veg)", "Food", 70, 110, "PG lunch range", now))
+assert hea.price_verdict("Daily Meal (Veg)", 85)[0] == "ok"
+assert hea.price_verdict("Daily Meal (Veg)", 60)[0] == "warn"          # under the band
+assert hea.price_verdict("Daily Meal (Veg)", 200)[0] == "warn"         # over the band
+assert hea.price_verdict("Daily Meal (Veg)", 45, 52)[0] == "bad"       # under her own cost
+assert hea.price_verdict("Daily Meal (Veg)", 55, 52)[0] == "warn"      # margin too thin
+assert hea.price_verdict("Tuition", 500)[0] is None                    # no band set
+hea.execute("UPDATE listings SET cost_price=52 WHERE id=?", (lid,))
+print("price policy ..... ok  cost check beats band check, both advisory")
 
 from streamlit.testing.v1 import AppTest
 
 PAGES = {
-    "admin": ["Dashboard", "Home Entrepreneurs", "Listings", "Orders", "Payouts", "Subscriptions",
+    "admin": ["Dashboard", "Home Entrepreneurs", "Listings", "Price Guidance", "Orders", "Payouts", "Subscriptions",
               "Custom Requests", "WhatsApp Outbox", "Fees & Settings"],
     "provider": ["My Profile & Verification", "My Listings", "Orders Received",
                  "Meal Plans & Subscribers", "Open Requests", "My Earnings"],
@@ -122,8 +135,10 @@ after = hea.q("SELECT COUNT(*) c FROM orders")[0]["c"]
 assert after == before + 1, (before, after)
 o = dict(hea.q("SELECT * FROM orders ORDER BY id DESC")[0])
 assert o["status"] == "Placed" and o["customer_total"] == 100.0, o
+assert (o["platform_fee"], o["ops_fee"], o["provider_payout"]) == (6.8, 1.7, 76.5), dict(o)
 assert hea.q("SELECT sold FROM listings WHERE id=?", (lid,))[0]["sold"] == 3
-print("place order ...... ok  ->", o["customer_total"], "paid,", o["provider_payout"], "to the cook")
+print("place order ...... ok  ->", o["customer_total"], "paid,", o["provider_payout"], "to the cook,",
+      o["platform_fee"], "platform +", o["ops_fee"], "ops")
 
 # provider advances that order
 at = AppTest.from_file(APP, default_timeout=30)
@@ -155,10 +170,10 @@ at.button(key=f"conf{o['id']}").click().run()
 assert not at.exception, at.exception
 assert dict(hea.q("SELECT * FROM orders WHERE id=?", (o["id"],))[0])["payment_status"] == "Paid"
 # still not delivered, so escrow must NOT release it yet
-assert hea.payout_due(pid)[0] == 156.4, hea.payout_due(pid)
+assert hea.payout_due(pid)[0] == 153.0, hea.payout_due(pid)
 hea.execute("UPDATE orders SET status='Delivered' WHERE id=?", (o["id"],))
-assert hea.payout_due(pid) == (234.6, 2), hea.payout_due(pid)
-print("escrow ........... ok  held until delivered, then ₹234.60 across 2 orders")
+assert hea.payout_due(pid) == (229.5, 2), hea.payout_due(pid)
+print("escrow ........... ok  held until delivered, then ₹229.50 across 2 orders")
 
 at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["admin"]
@@ -169,8 +184,8 @@ at.button[[b.label for b in at.button].index("Record payout")].click().run()
 assert not at.exception, at.exception
 assert hea.payout_due(pid)[0] == 0.0, hea.payout_due(pid)
 po = dict(hea.q("SELECT * FROM payouts ORDER BY id DESC")[0])
-assert po["amount"] == 234.6 and po["ref"] == "UPI-PAYOUT-4471", po
-print("payout ........... ok  ₹234.60 recorded, nothing outstanding")
+assert po["amount"] == 229.5 and po["ref"] == "UPI-PAYOUT-4471", po
+print("payout ........... ok  ₹229.50 recorded, nothing outstanding")
 
 # notifications: queued by real events, addressed to the right party, sendable by link
 msgs = [dict(m) for m in hea.q("SELECT * FROM notifications ORDER BY id")]

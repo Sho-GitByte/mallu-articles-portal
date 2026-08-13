@@ -149,15 +149,21 @@ break-even.
 | Packaging (box, lid, bag, sticker) | 10 |
 | **Her cost** | **52** |
 | Her price on the app | 85 |
-| Platform commission (8%) | −6.80 |
-| **She receives** | **78.20** |
-| **Her margin per meal** | **₹26.20** |
+| Platform fee (8%) | −6.80 |
+| Processing & support (2%) | −1.70 |
+| **She receives** | **76.50** |
+| **Her margin per meal** | **₹24.50** |
 
-At 20 meals a day, 25 days: **≈ ₹13,100 a month** from one slot. Show her this table, not a
+At 20 meals a day, 25 days: **≈ ₹12,250 a month** from one slot. Show her this table, not a
 promise. Then check the real numbers after week one and correct them together.
 
 **Rules of thumb:** price at roughly 1.6–1.8× her true cost. Never let her price below cost to
 "get started" — a cook who loses money quits in three weeks, and she'll be right to.
+
+Once you've done this with three or four cooks in a category, put the range you've learned into
+**Admin → Price Guidance**. From then on the app tells the next cook what's normal while she's
+typing her price, and flags anyone drifting below her own cost — the same coordination the team
+does by phone, minus the phone call.
 
 **Set the customer price against the local reality:** find the two nearest ₹100–150 lunch options
 and enter that as the "typical outside price" on the listing, so the saving shown in the app is

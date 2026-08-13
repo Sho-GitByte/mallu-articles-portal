@@ -56,8 +56,9 @@ their neighbourhood, with subscriptions, community pickup points and a transpare
 streamlit run home_economy_app.py     # own DB (gharse.db), same admin/admin@123 bootstrap
 ```
 
-Payments run on UPI with no gateway account: the customer pays the platform UPI ID (set under
-*Fees & Settings*) and submits the reference, admin confirms it, and the cook's share is released
+Commission is **10%**, itemised on every order as 8% platform + 2% processing & support, and
+editable under *Fees & Settings*. Payments run on UPI with no gateway account: the customer pays
+the platform UPI ID and submits the reference, admin confirms it, and the cook's share is released
 under *Payouts* once the order is delivered. WhatsApp messages queue in the *WhatsApp Outbox* and
 send with one tap via `wa.me` links; set `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_ID` (environment or
 `.streamlit/secrets.toml`) to have them send automatically through the Cloud API instead.
