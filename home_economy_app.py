@@ -184,6 +184,20 @@ def init_db():
     for k, v in DEFAULT_SETTINGS.items():
         if not q("SELECT 1 FROM settings WHERE key=?", (k,)):
             execute("INSERT INTO settings (key, value) VALUES (?,?)", (k, v))
+    migrate()
+
+# Additive column migrations, so a database created by an earlier version keeps working.
+NEW_COLUMNS = {
+    "providers": {"photo": "BLOB"},
+    "listings": {"photo": "BLOB"},
+}
+
+def migrate():
+    for table, cols in NEW_COLUMNS.items():
+        have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 # ----------------------------------------------------------------------------- HELPERS
 def idx(lst, val, default=0):
@@ -277,6 +291,36 @@ def repeat_customers(pid):
 
 def df(rows):
     return pd.DataFrame([dict(r) for r in rows])
+
+MAX_IMG_MB = 5
+
+def process_image(uploaded, max_px=900):
+    """Downscale an upload so the database stays small. Falls back to the raw bytes
+    if Pillow is unavailable — a slightly heavy row beats a lost photo."""
+    if uploaded is None:
+        return None
+    raw = uploaded.getvalue()
+    if not raw:
+        return None
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw))
+        if im.mode in ("RGBA", "P", "LA"):
+            im = im.convert("RGB")
+        im.thumbnail((max_px, max_px))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=82)
+        return buf.getvalue()
+    except Exception:
+        return raw
+
+def photo_of(row, fallback=None):
+    """Listing photo, else the kitchen's own photo, else nothing."""
+    for candidate in (row.get("photo") if isinstance(row, dict) else None, fallback):
+        if candidate:
+            return bytes(candidate)
+    return None
 
 def today_iso():
     return date.today().isoformat()
@@ -682,6 +726,23 @@ def provider_profile(user):
     kpi(c_, "Repeat customers", f"{repeat_customers(p['id'])}")
     st.write("")
 
+    pc = st.columns([1, 2])
+    with pc[0]:
+        if p.get("photo"):
+            st.image(bytes(p["photo"]), use_container_width=True)
+        else:
+            st.caption("No photo yet — customers scroll past listings without one.")
+    with pc[1]:
+        shot = st.file_uploader("Your kitchen / work photo", type=["jpg", "jpeg", "png", "webp"],
+                                key="provphoto")
+        if shot is not None and st.button("Save photo"):
+            if shot.size > MAX_IMG_MB * 1024 * 1024:
+                st.error(f"Please keep the photo under {MAX_IMG_MB} MB.")
+            else:
+                execute("UPDATE providers SET photo=? WHERE id=?", (process_image(shot), p["id"]))
+                st.success("Photo saved.")
+                st.rerun()
+
     with st.form("prof"):
         c = st.columns(2)
         display_name = c[0].text_input("Kitchen / business name", p.get("display_name") or "")
@@ -754,18 +815,21 @@ def provider_listings(user):
             c = st.columns(2)
             cuisine = c[0].selectbox("Cuisine", ["—"] + CUISINES)
             diet = c[1].selectbox("Veg / Non-veg", DIETS)
+            shot = st.file_uploader("Photo of the dish / item", type=["jpg", "jpeg", "png", "webp"])
             if st.form_submit_button("Publish", use_container_width=True):
                 if not title or price <= 0:
                     st.error("Title and a price above zero are required.")
+                elif shot is not None and shot.size > MAX_IMG_MB * 1024 * 1024:
+                    st.error(f"Please keep the photo under {MAX_IMG_MB} MB.")
                 else:
                     active = 1 if (kind != "Food" or food_ok) else 0
                     execute(
                         "INSERT INTO listings (provider_id, kind, category, title, description, cuisine, diet, "
-                        "price, unit, market_price, avail_date, slot, capacity, sold, active, created_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                        "price, unit, market_price, avail_date, slot, capacity, sold, active, photo, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
                         (p["id"], kind, category, title, desc, None if cuisine == "—" else cuisine, diet,
                          price, unit, market or None, avail.isoformat(), slot, int(capacity), active,
-                         datetime.utcnow().isoformat()),
+                         process_image(shot), datetime.utcnow().isoformat()),
                     )
                     st.success("Listing added." if active else "Saved, but held unpublished until verification.")
                     st.rerun()
@@ -778,7 +842,12 @@ def provider_listings(user):
         l = dict(r)
         left = max(0, (l["capacity"] or 0) - (l["sold"] or 0))
         with st.container(border=True):
-            c = st.columns([3, 1, 1])
+            c = st.columns([1, 3, 1, 1])
+            if l["photo"]:
+                c[0].image(bytes(l["photo"]), use_container_width=True)
+            else:
+                c[0].caption("No photo")
+            c = [c[1], c[2], c[3]]
             state = "<span class='pill ok'>Live</span>" if l["active"] else "<span class='pill warn'>Unpublished</span>"
             c[0].markdown(
                 f"**{l['title']}** {state}<br><span class='muted'>{l['kind']} · {l['category']} · "
@@ -799,6 +868,14 @@ def provider_listings(user):
             if b[2].button("Update capacity", key=f"uc{l['id']}", use_container_width=True):
                 execute("UPDATE listings SET capacity=? WHERE id=?", (int(newcap), l["id"]))
                 st.rerun()
+            with st.expander("Change photo"):
+                shot = st.file_uploader("New photo", type=["jpg", "jpeg", "png", "webp"], key=f"ph{l['id']}")
+                if shot is not None and st.button("Save photo", key=f"sp{l['id']}"):
+                    if shot.size > MAX_IMG_MB * 1024 * 1024:
+                        st.error(f"Please keep the photo under {MAX_IMG_MB} MB.")
+                    else:
+                        execute("UPDATE listings SET photo=? WHERE id=?", (process_image(shot), l["id"]))
+                        st.rerun()
 
 def provider_orders(user):
     p = provider_of(user)
@@ -986,8 +1063,8 @@ def customer_discover(user):
     only_today = st.checkbox("Only what's available today", value=True)
 
     sql = (
-        "SELECT l.*, p.display_name, p.area, p.verified, p.cuisines, p.owner_name FROM listings l "
-        "JOIN providers p ON p.id=l.provider_id WHERE l.active=1 AND l.sold < l.capacity"
+        "SELECT l.*, p.display_name, p.area, p.verified, p.cuisines, p.owner_name, p.photo pphoto "
+        "FROM listings l JOIN providers p ON p.id=l.provider_id WHERE l.active=1 AND l.sold < l.capacity"
     )
     params = []
     if kind != "Everything":
@@ -1018,7 +1095,12 @@ def customer_discover(user):
         left = (l["capacity"] or 0) - (l["sold"] or 0)
         rating, cnt = provider_rating(l["provider_id"])
         with st.container(border=True):
-            c = st.columns([3, 1.2])
+            shot = photo_of(l, l.get("pphoto"))
+            cols = st.columns([1.1, 3, 1.2]) if shot else st.columns([3, 1.2])
+            if shot:
+                cols[0].image(shot, use_container_width=True)
+                cols = cols[1:]
+            c = cols
             badges = "<span class='pill ok'>Verified ✓</span>" if l["verified"] else ""
             if rating:
                 badges += f"<span class='pill'>⭐ {rating} ({cnt})</span>"
