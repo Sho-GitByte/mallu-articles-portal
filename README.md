@@ -56,8 +56,17 @@ their neighbourhood, with subscriptions, community pickup points and a transpare
 streamlit run home_economy_app.py     # own DB (gharse.db), same admin/admin@123 bootstrap
 ```
 
-The business case — model, unit economics, delivery math, Bengaluru pilot plan and risks — is in
-[`BLUEPRINT.md`](BLUEPRINT.md).
+Payments run on UPI with no gateway account: the customer pays the platform UPI ID (set under
+*Fees & Settings*) and submits the reference, admin confirms it, and the cook's share is released
+under *Payouts* once the order is delivered. WhatsApp messages queue in the *WhatsApp Outbox* and
+send with one tap via `wa.me` links; set `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_ID` (environment or
+`.streamlit/secrets.toml`) to have them send automatically through the Cloud API instead.
+
+- [`BLUEPRINT.md`](BLUEPRINT.md) — the business case: model, unit economics, delivery math,
+  revenue streams, risks.
+- [`PILOT_KIT.md`](PILOT_KIT.md) — how to actually run the first neighbourhood: cook onboarding
+  and screening, FSSAI walkthrough, the pricing sheet, hygiene basics, the PG pitch, the daily
+  WhatsApp/UPI rhythm and what to measure.
 
 ## Tech
 
