@@ -238,7 +238,7 @@ rate holds.
 
 ```bash
 pip install -r requirements.txt
-streamlit run home_economy_app.py
+streamlit run app.py
 ```
 
 First login: `admin` / `admin@123` — change it under **Fees & Settings**. Home entrepreneurs and

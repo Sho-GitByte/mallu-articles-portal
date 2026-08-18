@@ -1,8 +1,8 @@
-"""Smoke test: render every page of home_economy_app.py for every role, with real data."""
+"""Smoke test: render every page of the GharSe app for every role, with real data."""
 import os, sys, tempfile, importlib.util
 from datetime import date, datetime, timedelta
 
-APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "home_economy_app.py")
+APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
 work = tempfile.mkdtemp()
 os.chdir(work)
 

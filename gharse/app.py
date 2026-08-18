@@ -1,8 +1,8 @@
-# home_economy_app.py
 # GharSe — Neighbourhood Home Economy Marketplace
 # Home food · handmade products · home-based services, sold by verified women entrepreneurs.
+# A standalone product — unrelated to the Mallu Articles articleship portal in this repository.
 # Single-file Streamlit app. Roles: Admin (platform) | Provider (home entrepreneur) | Customer
-# Run locally:  pip install -r requirements.txt  &&  streamlit run home_economy_app.py
+# Run locally:  pip install -r requirements.txt  &&  streamlit run app.py
 
 import streamlit as st
 import sqlite3
