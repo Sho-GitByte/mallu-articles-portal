@@ -5,11 +5,14 @@
 # Run locally:  pip install -r requirements.txt  &&  streamlit run app.py
 
 import streamlit as st
-import sqlite3
-import hashlib
 import re
 from datetime import datetime, date, timedelta
+from html import escape as esc
 import pandas as pd
+
+import store
+from store import (DEFAULT_SETTINGS, admin_password_is_default, execute, hash_pw, init_db,
+                   needs_rehash, now_ist, now_iso, q, set_setting, setting, today_ist, verify_pw)
 
 # ----------------------------------------------------------------------------- CONFIG
 st.set_page_config(
@@ -74,152 +77,11 @@ PLAN_PERIODS = [7, 15, 26, 30]
 
 PAYMENT_STATUSES = ["Unpaid", "Claimed", "Paid", "Refund due", "Refunded"]
 
-DEFAULT_SETTINGS = {
-    "platform_upi": "",          # the UPI ID customers pay into; set by admin before go-live
-    "brand_name": "GharSe",
-    "platform_pct": "8",         # onboarding, verification, the app itself
-    "ops_pct": "2",              # payment processing, support, coordination
-    "commission_pct": "8",       # legacy single rate; kept so old databases still read
-    "delivery_fee": "15",        # home delivery, per order
-    "pickup_point_fee": "5",     # batched drop at a PG / office / apartment gate
-    "self_pickup_fee": "0",
-    "min_order": "60",
-}
 
-# ----------------------------------------------------------------------------- DB LAYER
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def q(sql, params=()):
-    conn = get_conn()
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return rows
-
-def execute(sql, params=()):
-    conn = get_conn()
-    cur = conn.execute(sql, params)
-    conn.commit()
-    last = cur.lastrowid
-    conn.close()
-    return last
-
-def hash_pw(p):
-    return hashlib.sha256(p.encode()).hexdigest()
-
-def init_db():
-    conn = get_conn()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            pw_hash TEXT NOT NULL,
-            role TEXT NOT NULL,
-            linked_id INTEGER,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS providers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            display_name TEXT, owner_name TEXT, phone TEXT, email TEXT,
-            area TEXT, pincode TEXT, radius_km REAL DEFAULT 3,
-            kinds TEXT, categories TEXT, cuisines TEXT, languages TEXT,
-            diet TEXT, bio TEXT,
-            fssai_no TEXT, kyc_done INTEGER DEFAULT 0, hygiene_done INTEGER DEFAULT 0,
-            verified INTEGER DEFAULT 0, verify_note TEXT,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT, phone TEXT, email TEXT, area TEXT,
-            stay_type TEXT, pickup_point TEXT,
-            diet TEXT, spice TEXT, avoid TEXT, budget_per_meal REAL,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS listings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            provider_id INTEGER, kind TEXT, category TEXT, title TEXT, description TEXT,
-            cuisine TEXT, diet TEXT, price REAL, unit TEXT, market_price REAL,
-            avail_date TEXT, slot TEXT, capacity INTEGER DEFAULT 0, sold INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            listing_id INTEGER, provider_id INTEGER, customer_id INTEGER,
-            qty INTEGER, item_total REAL, delivery_fee REAL, platform_fee REAL,
-            provider_payout REAL, customer_total REAL,
-            delivery_mode TEXT, note TEXT, status TEXT, for_date TEXT, slot TEXT,
-            rating INTEGER, review TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            provider_id INTEGER, title TEXT, description TEXT, slot TEXT,
-            days INTEGER, price REAL, diet TEXT, active INTEGER DEFAULT 1, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plan_id INTEGER, provider_id INTEGER, customer_id INTEGER,
-            start_date TEXT, days INTEGER, price REAL, delivery_mode TEXT,
-            prefs TEXT, paused INTEGER DEFAULT 0, status TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER, kind TEXT, category TEXT, title TEXT, description TEXT,
-            area TEXT, budget REAL, needed_by TEXT, status TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS bids (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id INTEGER, provider_id INTEGER, price REAL, eta TEXT,
-            note TEXT, status TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS price_bands (
-            category TEXT PRIMARY KEY, kind TEXT, min_price REAL, max_price REAL,
-            note TEXT, updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            to_phone TEXT, to_name TEXT, to_role TEXT, kind TEXT, body TEXT,
-            order_id INTEGER, status TEXT, error TEXT, sent_at TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS payouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            provider_id INTEGER, amount REAL, orders_count INTEGER,
-            method TEXT, ref TEXT, note TEXT, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT
-        );
-        """
-    )
-    conn.commit()
-    conn.close()
-    # Seed the admin login and fee defaults only — NOT sample content.
-    if not q("SELECT 1 FROM users WHERE role='admin'"):
-        execute(
-            "INSERT INTO users (username, pw_hash, role, created_at) VALUES (?,?,?,?)",
-            ("admin", hash_pw("admin@123"), "admin", datetime.utcnow().isoformat()),
-        )
-    for k, v in DEFAULT_SETTINGS.items():
-        if not q("SELECT 1 FROM settings WHERE key=?", (k,)):
-            execute("INSERT INTO settings (key, value) VALUES (?,?)", (k, v))
-    migrate()
-
-# Additive column migrations, so a database created by an earlier version keeps working.
-NEW_COLUMNS = {
-    "providers": {"photo": "BLOB", "upi_id": "TEXT"},
-    "listings": {"photo": "BLOB", "cost_price": "REAL"},
-    "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT",
-               "ops_fee": "REAL DEFAULT 0"},
-}
-
-def migrate():
-    for table, cols in NEW_COLUMNS.items():
-        have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
-        for col, decl in cols.items():
-            if col not in have:
-                execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+# ----------------------------------------------------------------------------- DATA
+# Schema, migrations, connection handling, password hashing and IST time all live in
+# store.py, which speaks SQLite locally and Postgres in production. Everything below
+# writes plain SQL with ? placeholders and never touches a driver.
 
 # ----------------------------------------------------------------------------- HELPERS
 def idx(lst, val, default=0):
@@ -245,21 +107,6 @@ def mask_phone(p):
     if len(d) < 4:
         return "•••• (shared after order)"
     return d[:2] + "•" * (len(d) - 4) + d[-2:]
-
-def setting(key, cast=str):
-    rows = q("SELECT value FROM settings WHERE key=?", (key,))
-    val = rows[0]["value"] if rows else DEFAULT_SETTINGS.get(key, "0")
-    try:
-        return cast(val)
-    except (TypeError, ValueError):
-        return cast(DEFAULT_SETTINGS.get(key, "0"))
-
-def set_setting(key, value):
-    execute(
-        "INSERT INTO settings (key, value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, str(value)),
-    )
 
 def delivery_fee_for(mode):
     return {
@@ -311,7 +158,8 @@ def payout_due(provider_id):
 def cancel_order(o):
     """Free the capacity back up, and flag money that now has to travel back."""
     execute("UPDATE orders SET status='Cancelled' WHERE id=?", (o["id"],))
-    execute("UPDATE listings SET sold=MAX(0, sold-?) WHERE id=?", (o["qty"], o["listing_id"]))
+    execute("UPDATE listings SET sold = CASE WHEN sold - ? < 0 THEN 0 ELSE sold - ? END "
+            "WHERE id=?", (o["qty"], o["qty"], o["listing_id"]))
     if (o["payment_status"] or "Unpaid") in ("Claimed", "Paid"):
         execute("UPDATE orders SET payment_status='Refund due' WHERE id=?", (o["id"],))
 
@@ -338,7 +186,7 @@ def price_verdict(category, price, cost=None):
     return "ok", f"In the fair range for {category} ({inr(lo)}–{inr(hi)})."
 
 def pay_pill(status):
-    status = status or "Unpaid"
+    status = h(status or "Unpaid")
     cls = {"Paid": "ok", "Claimed": "", "Unpaid": "warn", "Refund due": "warn", "Refunded": ""}.get(status, "")
     return f"<span class='pill {cls}'>{status}</span>"
 
@@ -392,7 +240,7 @@ def send_whatsapp(phone, body):
         return False, str(e)[:200]
 
 def notify(phone, name, role, kind, body, order_id=None):
-    now = datetime.utcnow().isoformat()
+    now = now_iso()
     sent, err = send_whatsapp(phone, body)
     execute(
         "INSERT INTO notifications (to_phone, to_name, to_role, kind, body, order_id, status, error, "
@@ -413,9 +261,23 @@ def notify_customer(customer_id, kind, body, order_id=None):
 
 def authenticate(u, p):
     rows = q("SELECT * FROM users WHERE username=?", (u,))
-    if rows and rows[0]["pw_hash"] == hash_pw(p):
-        return dict(rows[0])
-    return None
+    if not rows or not verify_pw(p, rows[0]["pw_hash"]):
+        return None
+    user = dict(rows[0])
+    if needs_rehash(user["pw_hash"]):
+        # First sign-in since the upgrade: replace the old bare SHA-256 with a salted one.
+        execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(p), user["id"]))
+    return user
+
+def too_many_attempts(username):
+    """A crude per-session throttle. It will not stop a botnet, but it stops the
+    obvious thing: someone sitting at a laptop trying passwords on a kitchen's login."""
+    tries = st.session_state.setdefault("login_tries", {})
+    return tries.get(username, 0) >= 8
+
+def note_attempt(username, ok):
+    tries = st.session_state.setdefault("login_tries", {})
+    tries[username] = 0 if ok else tries.get(username, 0) + 1
 
 def provider_of(user):
     rows = q("SELECT * FROM providers WHERE id=?", (user["linked_id"],))
@@ -437,9 +299,15 @@ def provider_rating(pid):
 def repeat_customers(pid):
     rows = q(
         "SELECT COUNT(*) c FROM (SELECT customer_id FROM orders WHERE provider_id=? AND status='Delivered' "
-        "GROUP BY customer_id HAVING COUNT(*) > 1)", (pid,)
+        "GROUP BY customer_id HAVING COUNT(*) > 1) AS repeats", (pid,)
     )
     return rows[0]["c"]
+
+def h(v):
+    """Escape a database value on its way into unsafe_allow_html markup. A kitchen
+    called "Amma's" must not break the page, and a review containing a script tag
+    must never run."""
+    return esc("" if v is None else str(v), quote=True)
 
 def df(rows):
     return pd.DataFrame([dict(r) for r in rows])
@@ -526,7 +394,7 @@ def photo_of(row, fallback=None):
     return None
 
 def today_iso():
-    return date.today().isoformat()
+    return today_ist().isoformat()
 
 # ----------------------------------------------------------------------------- THEME / CSS
 def inject_css():
@@ -719,13 +587,20 @@ def login_register_view():
                 u = st.text_input("Username")
                 p = st.text_input("Password", type="password")
                 if st.form_submit_button("Sign in", use_container_width=True):
-                    user = authenticate(u, p)
-                    if user:
-                        st.session_state["user"] = user
-                        st.rerun()
+                    if too_many_attempts(u):
+                        st.error("Too many attempts on this username. Close the tab and try again, "
+                                 "or ask the team to reset the password.")
                     else:
-                        st.error("Invalid username or password.")
-            st.caption("Admin demo login → username **admin** · password **admin@123** (change it after first sign-in).")
+                        user = authenticate(u, p)
+                        note_attempt(u, bool(user))
+                        if user:
+                            st.session_state["user"] = user
+                            st.rerun()
+                        else:
+                            st.error("Invalid username or password.")
+            if admin_password_is_default():
+                st.caption("Running on the demo admin password — set a real one before this is "
+                           "reachable by anyone else. See DEPLOY.md.")
         with tab_reg:
             with st.form("register"):
                 acct = st.radio("I want to", ["Sell from home (Home entrepreneur)", "Buy home-made (Customer)"],
@@ -743,7 +618,7 @@ def login_register_view():
                     elif q("SELECT 1 FROM users WHERE username=?", (ru,)):
                         st.error("That username is taken.")
                     else:
-                        now = datetime.utcnow().isoformat()
+                        now = now_iso()
                         if acct.startswith("Sell"):
                             lid = execute(
                                 "INSERT INTO providers (display_name, area, created_at) VALUES (?,?,?)",
@@ -786,7 +661,7 @@ def sidebar_nav(user):
         choice = st.radio("Navigate", pages, label_visibility="collapsed")
         st.divider()
         st.markdown(
-            f"<span class='muted'>Signed in as</span><br><b>{user['username']}</b> · {role}",
+            f"<span class='muted'>Signed in as</span><br><b>{h(user['username'])}</b> · {role}",
             unsafe_allow_html=True,
         )
         if st.button("Log out", use_container_width=True):
@@ -856,7 +731,7 @@ def admin_dashboard():
     buyers = rows[0]["c"]
     rows = q(
         "SELECT COUNT(*) c FROM (SELECT customer_id FROM orders WHERE status='Delivered' "
-        "GROUP BY customer_id HAVING COUNT(*) > 1)"
+        "GROUP BY customer_id HAVING COUNT(*) > 1) AS repeats"
     )
     repeats = rows[0]["c"]
     if buyers:
@@ -890,7 +765,7 @@ def admin_providers():
         with st.container(border=True):
             st.markdown(
                 f"**{p['display_name'] or 'Unnamed'}** · {p['area'] or '—'} {badge}<br>"
-                f"<span class='muted'>{p['owner_name'] or '—'} · {p['phone'] or '—'} · "
+                f"<span class='muted'>{h(p['owner_name'] or '—')} · {h(p['phone'] or '—')} · "
                 f"FSSAI: {p['fssai_no'] or 'not provided'}</span>",
                 unsafe_allow_html=True,
             )
@@ -938,8 +813,8 @@ def admin_orders():
             with st.container(border=True):
                 c = st.columns([3, 1, 1])
                 c[0].markdown(
-                    f"**#{o['id']} · {o['item']} × {o['qty']}**<br>"
-                    f"<span class='muted'>{o['customer']} → {o['provider']} · ref {o['payment_ref'] or '—'}</span>",
+                    f"**#{h(o['id'])} · {h(o['item'])} × {h(o['qty'])}**<br>"
+                    f"<span class='muted'>{h(o['customer'])} → {h(o['provider'])} · ref {o['payment_ref'] or '—'}</span>",
                     unsafe_allow_html=True,
                 )
                 c[1].markdown(f"<div class='price'>{inr(o['customer_total'])}</div>", unsafe_allow_html=True)
@@ -1033,7 +908,7 @@ def admin_payouts():
         with st.container(border=True):
             c = st.columns([3, 1])
             c[0].markdown(
-                f"**{p['display_name']}** · {p['area'] or '—'}<br>"
+                f"**{h(p['display_name'])}** · {p['area'] or '—'}<br>"
                 f"<span class='muted'>{cnt} delivered & paid order(s) · UPI: "
                 f"{p['upi_id'] or 'NOT PROVIDED'}</span>",
                 unsafe_allow_html=True,
@@ -1057,7 +932,7 @@ def admin_payouts():
                         execute(
                             "INSERT INTO payouts (provider_id, amount, orders_count, method, ref, created_at) "
                             "VALUES (?,?,?,?,?,?)",
-                            (p["id"], round(amount, 2), cnt, method, ref.strip(), datetime.utcnow().isoformat()),
+                            (p["id"], round(amount, 2), cnt, method, ref.strip(), now_iso()),
                         )
                         notify_provider(p["id"], "payout",
                                         f"{inr(amount)} has been sent to you for {cnt} delivered order(s). "
@@ -1105,7 +980,7 @@ def admin_price_policy():
                             "kind=excluded.kind, min_price=excluded.min_price, max_price=excluded.max_price, "
                             "note=excluded.note, updated_at=excluded.updated_at",
                             (cat, kind, lo or None, hi or None, note.strip() or None,
-                             datetime.utcnow().isoformat()),
+                             now_iso()),
                         )
                     else:
                         execute("DELETE FROM price_bands WHERE category=?", (cat,))
@@ -1160,9 +1035,9 @@ def admin_outbox():
         n = dict(r)
         with st.container(border=True):
             st.markdown(
-                f"**{n['to_name'] or 'Unknown'}** · {n['to_role']} · {n['to_phone'] or 'no phone'} "
-                f"<span class='pill'>{n['kind']}</span><br><span class='muted'>{n['body']}</span>"
-                + (f"<br><span class='muted'>Last error: {n['error']}</span>" if n["error"] else ""),
+                f"**{n['to_name'] or 'Unknown'}** · {h(n['to_role'])} · {n['to_phone'] or 'no phone'} "
+                f"<span class='pill'>{h(n['kind'])}</span><br><span class='muted'>{h(n['body'])}</span>"
+                + (f"<br><span class='muted'>Last error: {h(n['error'])}</span>" if n["error"] else ""),
                 unsafe_allow_html=True,
             )
             b = st.columns([1, 1, 2])
@@ -1173,12 +1048,12 @@ def admin_outbox():
                 b[0].caption("No valid phone number on file.")
             if b[1].button("Mark sent", key=f"ms{n['id']}", use_container_width=True):
                 execute("UPDATE notifications SET status='Sent', sent_at=? WHERE id=?",
-                        (datetime.utcnow().isoformat(), n["id"]))
+                        (now_iso(), n["id"]))
                 st.rerun()
             if tok and phone_id and b[2].button("Retry via API", key=f"rt{n['id']}"):
                 ok, err = send_whatsapp(n["to_phone"], n["body"])
                 execute("UPDATE notifications SET status=?, error=?, sent_at=? WHERE id=?",
-                        ("Sent" if ok else "Queued", err, datetime.utcnow().isoformat() if ok else None, n["id"]))
+                        ("Sent" if ok else "Queued", err, now_iso() if ok else None, n["id"]))
                 st.rerun()
 
     st.markdown("#### Message history")
@@ -1362,7 +1237,7 @@ def provider_listings(user):
             desc = st.text_area("What's in it?", height=80)
             unit = st.selectbox("Unit", UNITS)
             c = st.columns(3)
-            avail = c[0].date_input("Available on", date.today())
+            avail = c[0].date_input("Available on", today_ist())
             slot = c[1].selectbox("Slot", SLOTS)
             capacity = c[2].number_input("How many can you make?", 1, 500, 10)
             c = st.columns(2)
@@ -1382,7 +1257,7 @@ def provider_listings(user):
                         "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
                         (p["id"], kind, category, title, desc, None if cuisine == "—" else cuisine, diet,
                          price, unit, cost or None, market or None, avail.isoformat(), slot, int(capacity),
-                         active, process_image(shot), datetime.utcnow().isoformat()),
+                         active, process_image(shot), now_iso()),
                     )
                     st.success("Listing added." if active else "Saved, but held unpublished until verification.")
                     st.rerun()
@@ -1403,13 +1278,13 @@ def provider_listings(user):
             c = [c[1], c[2], c[3]]
             state = "<span class='pill ok'>Live</span>" if l["active"] else "<span class='pill warn'>Unpublished</span>"
             c[0].markdown(
-                f"**{l['title']}** {state}<br><span class='muted'>{l['kind']} · {l['category']} · "
-                f"{l['avail_date']} · {l['slot']}</span>",
+                f"**{h(l['title'])}** {state}<br><span class='muted'>{h(l['kind'])} · {h(l['category'])} · "
+                f"{h(l['avail_date'])} · {h(l['slot'])}</span>",
                 unsafe_allow_html=True,
             )
-            c[1].markdown(f"<div class='price'>{inr(l['price'])}</div><span class='muted'>{l['unit']}</span>",
+            c[1].markdown(f"<div class='price'>{inr(l['price'])}</div><span class='muted'>{h(l['unit'])}</span>",
                           unsafe_allow_html=True)
-            c[2].markdown(f"**{left}** left<br><span class='muted'>of {l['capacity']}</span>", unsafe_allow_html=True)
+            c[2].markdown(f"**{left}** left<br><span class='muted'>of {h(l['capacity'])}</span>", unsafe_allow_html=True)
             b = st.columns(3)
             if b[0].button("Toggle live", key=f"tg{l['id']}", use_container_width=True):
                 if l["kind"] == "Food" and not food_ok and not l["active"]:
@@ -1448,16 +1323,16 @@ def provider_orders(user):
         with st.container(border=True):
             c = st.columns([3, 1, 1])
             c[0].markdown(
-                f"**#{o['id']} · {o['title']} × {o['qty']}**<br>"
-                f"<span class='muted'>{o['for_date']} · {o['slot']} · {o['delivery_mode']}"
+                f"**#{h(o['id'])} · {h(o['title'])} × {h(o['qty'])}**<br>"
+                f"<span class='muted'>{h(o['for_date'])} · {h(o['slot'])} · {h(o['delivery_mode'])}"
                 f"{' · ' + o['pickup_point'] if o['delivery_mode'] == 'Community pickup point' and o['pickup_point'] else ''}</span><br>"
-                f"<span class='muted'>{o['full_name']} · {o['phone'] if o['status'] not in ('Placed', 'Cancelled') else mask_phone(o['phone'])}</span>"
-                + (f"<br><span class='muted'>Note: {o['note']}</span>" if o["note"] else ""),
+                f"<span class='muted'>{h(o['full_name'])} · {o['phone'] if o['status'] not in ('Placed', 'Cancelled') else mask_phone(o['phone'])}</span>"
+                + (f"<br><span class='muted'>Note: {h(o['note'])}</span>" if o["note"] else ""),
                 unsafe_allow_html=True,
             )
             c[1].markdown(f"<div class='price'>{inr(o['provider_payout'])}</div><span class='muted'>you get</span>",
                           unsafe_allow_html=True)
-            c[2].markdown(f"<span class='pill'>{o['status']}</span> {pay_pill(o['payment_status'])}",
+            c[2].markdown(f"<span class='pill'>{h(o['status'])}</span> {pay_pill(o['payment_status'])}",
                           unsafe_allow_html=True)
             if (o["payment_status"] or "Unpaid") == "Unpaid" and o["status"] == "Placed":
                 st.caption("Not paid for yet — wait for payment before you start cooking.")
@@ -1512,7 +1387,7 @@ def provider_plans(user):
                     execute(
                         "INSERT INTO plans (provider_id, title, description, slot, days, price, diet, active, created_at) "
                         "VALUES (?,?,?,?,?,?,?,1,?)",
-                        (p["id"], title, desc, slot, int(days), price, diet, datetime.utcnow().isoformat()),
+                        (p["id"], title, desc, slot, int(days), price, diet, now_iso()),
                     )
                     st.success("Plan published.")
                     st.rerun()
@@ -1523,10 +1398,10 @@ def provider_plans(user):
         subs = q("SELECT COUNT(*) c FROM subscriptions WHERE plan_id=? AND status='Active'", (pl["id"],))[0]["c"]
         with st.container(border=True):
             c = st.columns([3, 1, 1])
-            c[0].markdown(f"**{pl['title']}** · {pl['slot']}<br><span class='muted'>{pl['description'] or ''}</span>",
+            c[0].markdown(f"**{h(pl['title'])}** · {h(pl['slot'])}<br><span class='muted'>{pl['description'] or ''}</span>",
                           unsafe_allow_html=True)
             c[1].markdown(f"<div class='price'>{inr(pl['price'])}</div>"
-                          f"<span class='muted'>{pl['days']} days · {inr(pl['price'] / pl['days'])}/meal</span>",
+                          f"<span class='muted'>{h(pl['days'])} days · {inr(pl['price'] / pl['days'])}/meal</span>",
                           unsafe_allow_html=True)
             c[2].markdown(f"**{subs}** subscribers", unsafe_allow_html=True)
             if st.button("Toggle active", key=f"pl{pl['id']}"):
@@ -1560,14 +1435,14 @@ def provider_requests(user):
         mine = q("SELECT * FROM bids WHERE request_id=? AND provider_id=?", (req["id"], p["id"]))
         with st.container(border=True):
             st.markdown(
-                f"**{req['title']}** <span class='pill'>{req['category']}</span><br>"
-                f"<span class='muted'>{req['area']} · needed by {req['needed_by']} · "
-                f"budget {inr(req['budget']) if req['budget'] else 'open'}</span><br>{req['description'] or ''}",
+                f"**{h(req['title'])}** <span class='pill'>{h(req['category'])}</span><br>"
+                f"<span class='muted'>{h(req['area'])} · needed by {h(req['needed_by'])} · "
+                f"budget {inr(req['budget']) if req['budget'] else 'open'}</span><br>{h(req['description'] or '')}",
                 unsafe_allow_html=True,
             )
             if mine:
                 b = dict(mine[0])
-                st.markdown(f"<span class='pill ok'>Your offer: {inr(b['price'])} · {b['status']}</span>",
+                st.markdown(f"<span class='pill ok'>Your offer: {inr(b['price'])} · {h(b['status'])}</span>",
                             unsafe_allow_html=True)
             else:
                 with st.form(f"bid{req['id']}"):
@@ -1582,7 +1457,7 @@ def provider_requests(user):
                             execute(
                                 "INSERT INTO bids (request_id, provider_id, price, eta, note, status, created_at) "
                                 "VALUES (?,?,?,?,?, 'Offered', ?)",
-                                (req["id"], p["id"], price, eta, note, datetime.utcnow().isoformat()),
+                                (req["id"], p["id"], price, eta, note, now_iso()),
                             )
                             notify_customer(req["customer_id"], "new_bid",
                                             f"{p['display_name']} has offered {inr(price)} for your request "
@@ -1689,12 +1564,12 @@ def customer_discover(user):
             if rating:
                 badges += f"<span class='pill'>⭐ {rating} ({cnt})</span>"
             c[0].markdown(
-                f"**{l['title']}** {badges}<br>"
-                f"<span class='muted'>{l['display_name']} · {l['area']} · {l['slot']} · {l['avail_date']}</span><br>"
+                f"**{h(l['title'])}** {badges}<br>"
+                f"<span class='muted'>{h(l['display_name'])} · {h(l['area'])} · {h(l['slot'])} · {h(l['avail_date'])}</span><br>"
                 f"{l['description'] or ''}<br>"
-                f"<span class='pill'>{l['category']}</span>"
-                + (f"<span class='pill'>{l['cuisine']}</span>" if l["cuisine"] else "")
-                + (f"<span class='pill'>{l['diet']}</span>" if l["diet"] else "")
+                f"<span class='pill'>{h(l['category'])}</span>"
+                + (f"<span class='pill'>{h(l['cuisine'])}</span>" if l["cuisine"] else "")
+                + (f"<span class='pill'>{h(l['diet'])}</span>" if l["diet"] else "")
                 + f"<span class='pill'>{left} left</span>",
                 unsafe_allow_html=True,
             )
@@ -1704,7 +1579,7 @@ def customer_discover(user):
                 save_html = (f"<div class='save'>Saves {inr(l['market_price'] - l['price'])} ({pct:.0f}%)<br>"
                              f"<span class='muted'>typical outside: {inr(l['market_price'])}</span></div>")
             c[1].markdown(
-                f"<div class='price'>{inr(l['price'])}</div><span class='muted'>{l['unit']}</span>{save_html}",
+                f"<div class='price'>{inr(l['price'])}</div><span class='muted'>{h(l['unit'])}</span>{save_html}",
                 unsafe_allow_html=True,
             )
             # Deliberately not a st.form — widgets outside a form rerun on change, so the
@@ -1728,7 +1603,7 @@ def customer_discover(user):
                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'Placed', ?,?, 'Unpaid', ?)",
                         (l["id"], l["provider_id"], cust["id"], int(qty), s["item_total"], s["delivery_fee"],
                          s["platform_fee"], s["ops_fee"], s["provider_payout"], s["customer_total"], mode, note,
-                         l["avail_date"], l["slot"], datetime.utcnow().isoformat()),
+                         l["avail_date"], l["slot"], now_iso()),
                     )
                     execute("UPDATE listings SET sold=sold+? WHERE id=?", (int(qty), l["id"]))
                     oid = q("SELECT MAX(id) m FROM orders")[0]["m"]
@@ -1762,8 +1637,8 @@ def customer_discover(user):
         with st.container(border=True):
             c = st.columns([3, 1.2])
             c[0].markdown(
-                f"**{pl['title']}** · {pl['display_name']} · {pl['area']}<br>"
-                f"<span class='muted'>{pl['slot']} · {pl['days']} days · {pl['diet'] or ''}</span><br>{pl['description'] or ''}",
+                f"**{h(pl['title'])}** · {h(pl['display_name'])} · {h(pl['area'])}<br>"
+                f"<span class='muted'>{h(pl['slot'])} · {h(pl['days'])} days · {pl['diet'] or ''}</span><br>{pl['description'] or ''}",
                 unsafe_allow_html=True,
             )
             c[1].markdown(
@@ -1771,7 +1646,7 @@ def customer_discover(user):
                 f"<span class='muted'>{inr(pl['price'] / pl['days'])} per meal</span>", unsafe_allow_html=True)
             with st.form(f"sub{pl['id']}"):
                 sc = st.columns([1.4, 1.6])
-                start = sc[0].date_input("Start from", date.today() + timedelta(days=1), key=f"sd{pl['id']}")
+                start = sc[0].date_input("Start from", today_ist() + timedelta(days=1), key=f"sd{pl['id']}")
                 mode = sc[1].selectbox("Delivery", DELIVERY_MODES, key=f"sm{pl['id']}")
                 if st.form_submit_button("Subscribe"):
                     prefs = (f"Diet: {cust.get('diet') or '—'} · Spice: {cust.get('spice') or '—'} · "
@@ -1781,7 +1656,7 @@ def customer_discover(user):
                         "INSERT INTO subscriptions (plan_id, provider_id, customer_id, start_date, days, price, "
                         "delivery_mode, prefs, paused, status, created_at) VALUES (?,?,?,?,?,?,?,?,0,'Active',?)",
                         (pl["id"], pl["provider_id"], cust["id"], start.isoformat(), pl["days"], pl["price"],
-                         mode, prefs, datetime.utcnow().isoformat()),
+                         mode, prefs, now_iso()),
                     )
                     notify_provider(pl["provider_id"], "new_subscription",
                                     f"New subscriber on GharSe: {cust.get('full_name') or 'a customer'} took "
@@ -1813,12 +1688,12 @@ def customer_orders(user):
         with st.container(border=True):
             c = st.columns([3, 1, 1])
             c[0].markdown(
-                f"**#{o['id']} · {o['title']} × {o['qty']}**<br>"
-                f"<span class='muted'>{o['display_name']} · {o['for_date']} · {o['slot']} · {o['delivery_mode']}</span>",
+                f"**#{h(o['id'])} · {h(o['title'])} × {h(o['qty'])}**<br>"
+                f"<span class='muted'>{h(o['display_name'])} · {h(o['for_date'])} · {h(o['slot'])} · {h(o['delivery_mode'])}</span>",
                 unsafe_allow_html=True,
             )
             c[1].markdown(f"<div class='price'>{inr(o['customer_total'])}</div>", unsafe_allow_html=True)
-            c[2].markdown(f"<span class='pill'>{o['status']}</span> {pay_pill(o['payment_status'])}",
+            c[2].markdown(f"<span class='pill'>{h(o['status'])}</span> {pay_pill(o['payment_status'])}",
                           unsafe_allow_html=True)
             st.markdown(money_split_caption({
                 "customer_total": o["customer_total"], "provider_payout": o["provider_payout"],
@@ -1843,7 +1718,7 @@ def customer_orders(user):
                             st.error("Enter the reference number your UPI app showed after payment.")
                         else:
                             execute("UPDATE orders SET payment_status='Claimed', payment_ref=?, paid_at=? "
-                                    "WHERE id=?", (ref.strip(), datetime.utcnow().isoformat(), o["id"]))
+                                    "WHERE id=?", (ref.strip(), now_iso(), o["id"]))
                             st.success("Thanks — the team will confirm it shortly.")
                             st.rerun()
             elif o["payment_status"] == "Claimed":
@@ -1879,14 +1754,14 @@ def customer_subscriptions(user):
         with st.container(border=True):
             c = st.columns([3, 1, 1])
             c[0].markdown(
-                f"**{s['title']}** · {s['display_name']}<br>"
-                f"<span class='muted'>{s['slot']} · from {s['start_date']} · {s['days']} days · {s['delivery_mode']}</span><br>"
-                f"<span class='muted'>{s['prefs'] or ''}</span>",
+                f"**{h(s['title'])}** · {h(s['display_name'])}<br>"
+                f"<span class='muted'>{h(s['slot'])} · from {h(s['start_date'])} · {h(s['days'])} days · {h(s['delivery_mode'])}</span><br>"
+                f"<span class='muted'>{h(s['prefs'] or '')}</span>",
                 unsafe_allow_html=True,
             )
             c[1].markdown(f"<div class='price'>{inr(s['price'])}</div>"
                           f"<span class='muted'>{inr(s['price'] / s['days'])}/meal</span>", unsafe_allow_html=True)
-            state = "Paused" if s["paused"] else s["status"]
+            state = "Paused" if s["paused"] else h(s["status"])
             c[2].markdown(f"<span class='pill'>{state}</span>", unsafe_allow_html=True)
             b = st.columns(2)
             if s["status"] == "Active":
@@ -1911,7 +1786,7 @@ def customer_requests(user):
             desc = st.text_area("Details", height=80)
             c = st.columns(3)
             budget = c[0].number_input("Budget (₹, optional)", 0.0, 500000.0, 0.0, step=100.0)
-            needed = c[1].date_input("Needed by", date.today() + timedelta(days=3))
+            needed = c[1].date_input("Needed by", today_ist() + timedelta(days=3))
             area = c[2].selectbox("Area", AREAS, index=idx(AREAS, cust.get("area")))
             if st.form_submit_button("Post request", use_container_width=True):
                 if not title:
@@ -1921,7 +1796,7 @@ def customer_requests(user):
                         "INSERT INTO requests (customer_id, kind, category, title, description, area, budget, "
                         "needed_by, status, created_at) VALUES (?,?,?,?,?,?,?,?, 'Open', ?)",
                         (cust["id"], kind, category, title, desc, area, budget or None, needed.isoformat(),
-                         datetime.utcnow().isoformat()),
+                         now_iso()),
                     )
                     st.success("Posted. Offers will appear below.")
                     st.rerun()
@@ -1931,8 +1806,8 @@ def customer_requests(user):
         req = dict(r)
         with st.container(border=True):
             st.markdown(
-                f"**{req['title']}** <span class='pill'>{req['status']}</span><br>"
-                f"<span class='muted'>{req['category']} · {req['area']} · by {req['needed_by']} · "
+                f"**{h(req['title'])}** <span class='pill'>{h(req['status'])}</span><br>"
+                f"<span class='muted'>{h(req['category'])} · {h(req['area'])} · by {h(req['needed_by'])} · "
                 f"budget {inr(req['budget']) if req['budget'] else 'open'}</span>",
                 unsafe_allow_html=True,
             )
@@ -1947,7 +1822,7 @@ def customer_requests(user):
                 bc = st.columns([3, 1, 1])
                 badge = "<span class='pill ok'>Verified ✓</span>" if b["verified"] else ""
                 bc[0].markdown(
-                    f"{b['display_name']} · {b['area']} {badge}<br><span class='muted'>Ready by {b['eta'] or '—'} · "
+                    f"{h(b['display_name'])} · {h(b['area'])} {badge}<br><span class='muted'>Ready by {b['eta'] or '—'} · "
                     f"{b['note'] or ''}</span>", unsafe_allow_html=True)
                 bc[1].markdown(f"**{inr(b['price'])}**")
                 if req["status"] == "Open":
@@ -1961,7 +1836,7 @@ def customer_requests(user):
                                         f"Needed by {req['needed_by']}.")
                         st.rerun()
                 else:
-                    bc[2].markdown(f"<span class='pill'>{b['status']}</span>", unsafe_allow_html=True)
+                    bc[2].markdown(f"<span class='pill'>{h(b['status'])}</span>", unsafe_allow_html=True)
             if req["status"] == "Assigned":
                 if st.button("Mark completed", key=f"rc{req['id']}"):
                     execute("UPDATE requests SET status='Completed' WHERE id=?", (req["id"],))

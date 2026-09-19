@@ -1,0 +1,19 @@
+# Streamlit's own theme. The app injects its own CSS for everything it can reach, but
+# native widgets, popovers, tooltips and spinners follow THIS file — without it they
+# render in Streamlit's default light theme on top of a near-black page.
+[theme]
+base = "dark"
+primaryColor = "#ffa62b"              # amber: selected radio, checkbox, focus ring, links
+backgroundColor = "#0d0a07"           # the warm near-black the CSS paints over
+secondaryBackgroundColor = "#1b1409"  # inputs, sidebar, raised surfaces
+textColor = "#f6efe6"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Photos are downscaled to ~900px JPEG before storage; 10MB is generous headroom for
+# whatever a phone camera hands us, and keeps a bad upload from eating the container.
+maxUploadSize = 10
+enableXsrfProtection = true

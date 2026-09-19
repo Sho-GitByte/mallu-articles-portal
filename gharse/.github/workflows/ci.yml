@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install sqlglot          # dialect test only, not needed to run the app
+
+      - name: SQL is valid for SQLite and Postgres
+        run: python test_sql_dialects.py
+
+      - name: Every page renders, and the money path holds
+        run: |
+          set -o pipefail
+          python smoke_test.py | tee out.txt
+          grep -q "FAILURES: 0" out.txt

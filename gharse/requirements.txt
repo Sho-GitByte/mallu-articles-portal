@@ -1,4 +1,5 @@
-streamlit>=1.40
-pandas>=2.0
-Pillow>=10.0
-requests>=2.31
+streamlit>=1.40        # the whole UI
+pandas>=2.0            # dataframes behind a few admin aggregations
+Pillow>=10.0           # downscales uploaded photos to ~900px JPEG before storage
+requests>=2.31         # WhatsApp Cloud API calls when credentials are configured
+psycopg2-binary>=2.9   # Postgres in production; unused when running on local SQLite

@@ -1,0 +1,24 @@
+# The database and anything else holding real people's data
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# Real secrets. The .example file beside it IS tracked, on purpose.
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

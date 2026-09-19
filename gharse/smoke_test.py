@@ -2,7 +2,9 @@
 import os, sys, tempfile, importlib.util
 from datetime import date, datetime, timedelta
 
-APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+APP = os.path.join(ROOT, "app.py")
+sys.path.insert(0, ROOT)          # app.py imports store.py from beside it
 work = tempfile.mkdtemp()
 os.chdir(work)
 
@@ -94,6 +96,35 @@ assert hea.price_verdict("Daily Meal (Veg)", 55, 52)[0] == "warn"      # margin 
 assert hea.price_verdict("Tuition", 500)[0] is None                    # no band set
 hea.execute("UPDATE listings SET cost_price=52 WHERE id=?", (lid,))
 print("price policy ..... ok  cost check beats band check, both advisory")
+
+# ---- store layer: passwords, legacy upgrade, India time, portable SQL
+import store
+assert store.KIND == "sqlite", store.KIND
+hashed = store.hash_pw("cook@123")
+assert hashed.startswith("pbkdf2_sha256$") and "cook@123" not in hashed
+assert store.verify_pw("cook@123", hashed) and not store.verify_pw("cook@124", hashed)
+assert not store.needs_rehash(hashed)
+legacy = __import__("hashlib").sha256(b"old-password").hexdigest()
+assert store.verify_pw("old-password", legacy), "existing users must not be locked out"
+assert store.needs_rehash(legacy), "a legacy hash must be flagged for upgrade"
+assert store.verify_pw("x", "") is False and store.verify_pw("x", "garbage") is False
+ist = store.now_ist()
+assert ist.utcoffset().total_seconds() == 19800, ist.utcoffset()
+assert store.today_ist() == ist.date()
+print("store ............ ok  pbkdf2 + legacy upgrade + IST")
+
+# app.py must not talk to a driver itself any more
+src = open(APP, encoding="utf-8").read()
+assert "sqlite3" not in src and "import hashlib" not in src, "app.py still owns a driver"
+assert "AUTOINCREMENT" not in src and "PRAGMA" not in src, "sqlite-only DDL left in app.py"
+assert "MAX(0," not in src, "sqlite two-arg MAX left in app.py"
+
+# the fee split must always reconcile, at any price
+for price in (33, 85, 99.5, 140, 7, 1234):
+    m = hea.split_money(price, "Home delivery")
+    assert round(m["platform_fee"] + m["ops_fee"] + m["provider_payout"], 2) == round(price, 2), m
+    assert round(m["customer_total"] - m["delivery_fee"], 2) == round(price, 2), m
+print("fee split ........ ok  platform + ops + payout == item total, every price")
 
 from streamlit.testing.v1 import AppTest
 
@@ -213,6 +244,21 @@ assert not at.exception, at.exception
 at.button(key=f"ms{msgs[0]['id']}").click().run()
 assert dict(hea.q("SELECT * FROM notifications WHERE id=?", (msgs[0]["id"],))[0])["status"] == "Sent"
 print("outbox ........... ok  marked one sent")
+
+# cancelling restores capacity via the portable CASE expression (no sqlite MAX)
+sold_before = hea.q("SELECT sold FROM listings WHERE id=?", (lid,))[0]["sold"]
+victim = dict(hea.q("SELECT * FROM orders ORDER BY id DESC")[0])
+hea.cancel_order(victim)
+sold_after = hea.q("SELECT sold FROM listings WHERE id=?", (lid,))[0]["sold"]
+assert sold_after == sold_before - victim["qty"], (sold_before, sold_after)
+assert dict(hea.q("SELECT * FROM orders WHERE id=?", (victim["id"],))[0])["status"] == "Cancelled"
+assert hea.q("SELECT sold FROM listings WHERE id=?", (lid,))[0]["sold"] >= 0
+print("cancel ........... ok  capacity returned, no negative sold")
+
+# escaping: a kitchen name with a quote, and a review with a script tag
+assert hea.h("Amma's <script>alert(1)</script>") == \
+    "Amma&#x27;s &lt;script&gt;alert(1)&lt;/script&gt;"
+print("escaping ......... ok  markup in DB text cannot reach the page")
 
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)
