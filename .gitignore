@@ -1,7 +1,7 @@
 # --- Mallu Articles Portal ---
 
 # Local database (contains real candidate/firm data + uploaded resumes — never commit)
-mallu_articles.db
+praxisdesk.db
 *.db
 *.sqlite
 *.sqlite3

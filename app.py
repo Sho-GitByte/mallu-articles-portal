@@ -1,5 +1,5 @@
 # app.py
-# Mallu Articles Bengaluru — CA/CMA Articleship Connecting Portal
+# PraxisDesk — CA/CMA Articleship & Early-Career Placement Portal
 # Single-file Streamlit app. Roles: Admin (broker) | Firm (recruiter) | Candidate (student)
 # Run locally:  pip install -r requirements.txt  &&  streamlit run app.py
 
@@ -12,13 +12,13 @@ import pandas as pd
 
 # ----------------------------------------------------------------------------- CONFIG
 st.set_page_config(
-    page_title="Mallu Articles Bengaluru | Articleship Portal",
+    page_title="PraxisDesk | Articleship & Early-Career Placement",
     page_icon="📘",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "mallu_articles.db"
+DB_PATH = "praxisdesk.db"
 
 ROLES = [
     "CA Article", "CMA Article", "Audit Assistant", "Paid Assistant",
@@ -249,8 +249,8 @@ def login_register_view():
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         st.markdown(
-            "<div class='brand' style='text-align:center'>Mallu Articles <span class='accent'>Bengaluru</span></div>"
-            "<div class='brand-sub' style='text-align:center'>CA / CMA ARTICLESHIP CONNECT</div><br>",
+            "<div class='brand' style='text-align:center'>Praxis<span class='accent'>Desk</span></div>"
+            "<div class='brand-sub' style='text-align:center'>CA · CMA ARTICLESHIP PLACEMENT</div><br>",
             unsafe_allow_html=True,
         )
         tab_login, tab_reg = st.tabs(["Sign in", "Register"])
@@ -302,8 +302,8 @@ def login_register_view():
 def sidebar_nav(user):
     with st.sidebar:
         st.markdown(
-            "<div class='brand'>Mallu Articles <span class='accent'>Bengaluru</span></div>"
-            "<div class='brand-sub'>ARTICLESHIP CONNECT</div>",
+            "<div class='brand'>Praxis<span class='accent'>Desk</span></div>"
+            "<div class='brand-sub'>ARTICLESHIP PLACEMENT</div>",
             unsafe_allow_html=True,
         )
         st.write("")
