@@ -410,7 +410,11 @@ def _details_form(me, linked):
     with st.form("profile_details"):
         c = st.columns(2)
         full_name = c[0].text_input("Full name", _name_prefill(me, linked), placeholder="As neighbours know you")
-        phone = c[1].text_input("Mobile number", me.get("phone") or "", placeholder="10-digit mobile, e.g. 98450 12345")
+        locked = bool(me.get("phone_verified")) and bool(me.get("phone"))
+        phone = c[1].text_input("Mobile number", me.get("phone") or "", disabled=locked,
+                                placeholder="10-digit mobile, e.g. 98450 12345",
+                                help=("Verified by OTP. To use a different number, go to Verify Identity — "
+                                      "the new number needs its own code.") if locked else None)
         email = st.text_input("Email (optional)", me.get("email") or "", placeholder="you@example.com")
         bio = st.text_area("A line about you", me.get("bio") or "", max_chars=BIO_MAX, height=90,
                            placeholder={"provider": "Cooking Kerala meals for 20 years; I also stitch blouses.",
@@ -425,6 +429,8 @@ def _details_form(me, linked):
     if not submitted:
         return
     name = (full_name or "").strip()
+    if locked:
+        phone = me.get("phone")             # a disabled field must not be able to change it
     norm = normalise_phone(phone)
     errors = []
     if norm is None:
@@ -449,13 +455,21 @@ def _details_form(me, linked):
 
     em = (email or "").strip()
     about = (bio or "").strip()[:BIO_MAX]
-    hit = execute("UPDATE users SET full_name=?, phone=?, email=?, bio=? WHERE id=? RETURNING id",
-                  (name or None, norm or None, em or None, about or None, me["id"]))
+    # A changed number is not the number anyone proved with an OTP, so it stops counting as
+    # verified in the same statement — otherwise a verified account could quietly show
+    # strangers somebody else's number under a "verified" badge.
+    hit = execute("UPDATE users SET full_name=?, email=?, bio=?, "
+                  "phone_verified = CASE WHEN COALESCE(phone,'') = ? THEN phone_verified ELSE 0 END, "
+                  "phone_verified_at = CASE WHEN COALESCE(phone,'') = ? THEN phone_verified_at ELSE NULL END, "
+                  "phone=? WHERE id=? RETURNING id",
+                  (name or None, em or None, about or None, norm or "", norm or "", norm or None, me["id"]))
     if hit is None:
         st.error("Your account couldn't be found any more, so nothing was saved. "
                  "Please sign out and sign in again.")
         return
     fields = dict(full_name=name or None, phone=norm or None, email=em or None, bio=about or None)
+    if (norm or "") != (normalise_phone(me.get("phone")) or ""):
+        fields.update(phone_verified=0, phone_verified_at=None)
     if new_photo:
         execute("UPDATE users SET photo=? WHERE id=?", (new_photo, me["id"]))
         fields["photo"] = new_photo

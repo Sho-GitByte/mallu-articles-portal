@@ -18,8 +18,12 @@ from ui import (MAX_IMG_MB, safe_image, csv_join, csv_split, customer_of, df, h,
                 wa_number)
 import ask
 import fssai
+import kyc
 import learn
 import profile
+import rentals
+import safety
+import social
 import themes
 from store import (DEFAULT_SETTINGS, admin_password_is_default, execute, hash_pw, init_db,
                    needs_rehash, now_ist, now_iso, q, set_setting, setting, today_ist, verify_pw)
@@ -305,10 +309,22 @@ def login_register_view():
                         st.rerun()
 
 # ----------------------------------------------------------------------------- SIDEBAR NAV
-def role_pages(user):
-    """Every page a role can open, in sidebar order, as (label, render(user))."""
+SPACES = {"market": "GharSe", "social": "Social"}
+
+def role_pages(user, space="market"):
+    """Every page a role can open in a space, in sidebar order, as (label, render(user)).
+    GharSe Social is its own space — events, meetups, trips, rooms — reached from the top
+    of the sidebar with the same login, the same identity checks and the same theme."""
     role = user["role"]
     if role == "admin":
+        if space == "social":
+            return [
+                (kyc.ADMIN_PAGE_TITLE, kyc.admin_kyc),
+                (safety.ADMIN_PAGE_TITLE, safety.admin_reports),
+                (social.ADMIN_PAGE_TITLE, social.social_admin),
+                (rentals.ADMIN_PAGE_TITLE, rentals.rentals_admin),
+                (profile.PROFILE_PAGE_TITLE, profile.profile_page),
+            ]
         return [
             ("Dashboard", lambda u: admin_dashboard()),
             ("Home Entrepreneurs", admin_providers),
@@ -324,6 +340,13 @@ def role_pages(user):
             ("Fees & Settings", lambda u: admin_settings()),
             (profile.PROFILE_PAGE_TITLE, profile.profile_page),
         ]
+    if space == "social":
+        return [
+            (social.SOCIAL_PAGE_TITLE, social.social_home),
+            (rentals.RENTALS_PAGE_TITLE, rentals.rentals_home),
+            (kyc.KYC_PAGE_TITLE, kyc.kyc_page),
+            (profile.PROFILE_PAGE_TITLE, profile.profile_page),
+        ]
     if role == "provider":
         return [
             ("My Kitchen", provider_profile),
@@ -335,6 +358,7 @@ def role_pages(user):
             ("Learn & Earn", learn.learn_and_earn),
             ("My Earnings", provider_earnings),
             ("FSSAI Guide", fssai.fssai_guide),
+            (kyc.KYC_PAGE_TITLE, kyc.kyc_page),
             (profile.PROFILE_PAGE_TITLE, profile.profile_page),
         ]
     return [
@@ -344,6 +368,7 @@ def role_pages(user):
         (ask.ASK_PAGE_TITLES["customer"], ask.ask_customer),
         ("Learn & Earn", learn.learn_and_earn),
         ("My Preferences", customer_prefs),
+        (kyc.KYC_PAGE_TITLE, kyc.kyc_page),
         (profile.PROFILE_PAGE_TITLE, profile.profile_page),
     ]
 
@@ -357,7 +382,14 @@ def sidebar_nav(user):
             unsafe_allow_html=True,
         )
         st.write("")
-        if user["role"] != "admin":
+        space = st.session_state.get("space", "market")
+        pick = st.radio("Space", list(SPACES), index=list(SPACES).index(space), horizontal=True,
+                        format_func=SPACES.get, key="space_pick", label_visibility="collapsed")
+        if pick != space:
+            st.session_state["space"] = pick
+            st.session_state.pop("nav", None)     # the other space has different pages
+            st.rerun()
+        if user["role"] != "admin" and space == "market":
             if user.get("has_customer") and user.get("has_provider"):
                 sides = ["customer", "provider"]
                 pick = st.radio("Using GharSe as", sides, index=sides.index(user["role"]),
@@ -374,7 +406,7 @@ def sidebar_nav(user):
                     add_side(user, "customer")
                     st.rerun()
             st.write("")
-        labels = [label for label, _ in role_pages(user)]
+        labels = [label for label, _ in role_pages(user, space)]
         choice = st.radio("Navigate", labels, label_visibility="collapsed", key="nav")
         st.divider()
         st.markdown(
@@ -752,7 +784,7 @@ def admin_outbox():
         n = dict(r)
         with st.container(border=True):
             st.markdown(
-                f"**{n['to_name'] or 'Unknown'}** · {h(n['to_role'])} · {n['to_phone'] or 'no phone'} "
+                f"<b>{h(n['to_name'] or 'Unknown')}</b> · {h(n['to_role'])} · {h(n['to_phone'] or 'no phone')} "
                 f"<span class='pill'>{h(n['kind'])}</span><br><span class='muted'>{h(n['body'])}</span>"
                 + (f"<br><span class='muted'>Last error: {h(n['error'])}</span>" if n["error"] else ""),
                 unsafe_allow_html=True,
@@ -797,7 +829,16 @@ def admin_settings():
         pfee = c[1].number_input("Community pickup point fee (₹)", 0.0, 100.0,
                                  setting("pickup_point_fee", float), step=1.0)
         sfee = c[2].number_input("Self pickup fee (₹)", 0.0, 100.0, setting("self_pickup_fee", float), step=1.0)
+        st.markdown("**Grievance officer** — India's IT Rules 2021 require a platform to name one and "
+                    "publish how to reach them. Shown on every Social page and in the terms.")
+        c = st.columns(3)
+        g_name = c[0].text_input("Name", setting("grievance_name", str), key="g_name")
+        g_email = c[1].text_input("Email", setting("grievance_email", str), key="g_email")
+        g_phone = c[2].text_input("Phone", setting("grievance_phone", str), key="g_phone")
         if st.form_submit_button("Save settings", use_container_width=True):
+            set_setting("grievance_name", g_name.strip())
+            set_setting("grievance_email", g_email.strip())
+            set_setting("grievance_phone", g_phone.strip())
             set_setting("platform_upi", upi.strip())
             set_setting("platform_pct", plat)
             set_setting("ops_pct", ops)
@@ -1499,7 +1540,7 @@ def customer_prefs(user):
 
 # ----------------------------------------------------------------------------- ROUTER
 def dispatch(user, page):
-    pages = dict(role_pages(user))
+    pages = dict(role_pages(user, st.session_state.get("space", "market")))
     pages.get(page, next(iter(pages.values())))(user)
 
 def main():
@@ -1509,8 +1550,34 @@ def main():
     if not user:
         login_register_view()
         return
+    fresh = q("SELECT * FROM users WHERE id=?", (user["id"],))
+    if not fresh:
+        st.session_state.pop("user", None)
+        st.rerun()
+    me = dict(fresh[0])
+    if user["role"] != "admin" and safety.is_suspended(me):
+        on_hold(me)
+        return
     page = sidebar_nav(user)
     dispatch(user, page)
+
+def on_hold(row):
+    """Reports from several different people put an account on hold until the team reviews
+    them. The person can read why and how to reach the grievance officer, and nothing else."""
+    with st.sidebar:
+        st.markdown("<div class='brand'>Ghar<span class='accent'>Se</span></div>", unsafe_allow_html=True)
+        if st.button("Log out", use_container_width=True):
+            st.session_state.pop("user", None)
+            st.rerun()
+    st.markdown("<div class='page-title'>Your account is on hold</div>"
+                "<div class='page-sub'>The team is reviewing reports about it.</div>",
+                unsafe_allow_html=True)
+    if row.get("suspended_reason"):
+        st.markdown(f"<span class='muted'>Reason: {h(row['suspended_reason'])}</span>",
+                    unsafe_allow_html=True)
+    st.markdown("Nothing has been decided against you yet. If you think this is a mistake, write to "
+                "the grievance officer — they have to respond.")
+    st.markdown(safety.grievance_line(), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

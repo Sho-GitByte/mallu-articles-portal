@@ -20,6 +20,8 @@ from urllib.parse import parse_qs, quote_plus, urlsplit
 import streamlit as st
 
 from catalog import AREAS, ASK_GROUPS, JOB_KINDS, LANGUAGES, PAY_UNITS, SKILL_LEVELS, SKILLS, TEACH_MODES
+
+IN_HOME_MODES = {"At my home", "At the learner's home"}
 from store import execute, now_iso, q, today_ist
 from ui import csv_join, csv_split, customer_of, h, idx, inr, kpi, notify, provider_of, short_dt, table, wa_link
 
@@ -744,6 +746,13 @@ def _teach(user, me, area):
                 if not where:
                     st.error("Choose the area you teach in.")
                     return
+                # Teaching inside a home — hers or the learner's — means a stranger at the door,
+                # so it needs a verified identity, as the founder asked. Video calls and group
+                # classes in a public place do not.
+                if mode in IN_HOME_MODES:
+                    import kyc
+                    if not kyc.require(user, "teach at home"):
+                        return
                 existing = q("SELECT id FROM skill_offers WHERE teacher_user_id=? AND skill=?", (user["id"], skill))
                 vals = (level, mode, fee, unit, where, csv_join(langs), about.strip())
                 if existing:

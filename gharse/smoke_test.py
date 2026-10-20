@@ -133,10 +133,16 @@ print("fee split ........ ok  platform + ops + payout == item total, every price
 from streamlit.testing.v1 import AppTest
 
 USERS = {r: dict(hea.q("SELECT * FROM users WHERE role=?", (r,))[0]) for r in ("admin", "provider", "customer")}
-PAGES = {r: [label for label, _ in hea.role_pages(USERS[r])] for r in USERS}
+# every page in both spaces, read from the app's own navigation so the test cannot drift
+PAGES = {r: [(sp, label) for sp in ("market", "social") for label, _ in hea.role_pages(USERS[r], sp)]
+         for r in USERS}
+LABELS = {r: [label for _, label in PAGES[r]] for r in PAGES}
 for must in ("My Profile", "Learn & Earn"):
-    assert all(must in PAGES[r] for r in PAGES), (must, PAGES)
-assert "FSSAI Certificate" in PAGES["provider"] and "FSSAI Guide" in PAGES["admin"], PAGES
+    assert all(must in LABELS[r] for r in LABELS), (must, LABELS)
+assert "FSSAI Certificate" in LABELS["provider"] and "FSSAI Guide" in LABELS["admin"], LABELS
+for r in ("provider", "customer"):
+    assert {"Verify Identity", "Events & Meetups", "Rooms & PGs"} <= set(LABELS[r]), (r, LABELS[r])
+assert {"KYC Queue", "Reports", "Events Admin", "Rentals Admin"} <= set(LABELS["admin"]), LABELS["admin"]
 
 at = AppTest.from_file(APP, default_timeout=30)
 at.run()
@@ -145,16 +151,18 @@ print("login page ....... ok")
 
 fails = 0
 for role, pages in PAGES.items():
-    for page in pages:
+    for space, page in pages:
         at = AppTest.from_file(APP, default_timeout=30)
         at.session_state["user"] = USERS[role]
+        at.session_state["space"] = space
         at.run()
-        at.sidebar.radio[0].set_value(page).run()
+        at.sidebar.radio(key="nav").set_value(page).run()
+        tag = f"{role} · {space}"
         if at.exception:
             fails += 1
-            print(f"{role:9} {page:32} FAIL\n{at.exception}")
+            print(f"{tag:18} {page:26} FAIL\n{at.exception}")
         else:
-            print(f"{role:9} {page:32} ok")
+            print(f"{tag:18} {page:26} ok")
 
 # exercise one real interaction: customer places an order from Discover
 at = AppTest.from_file(APP, default_timeout=30)
@@ -177,7 +185,7 @@ print("place order ...... ok  ->", o["customer_total"], "paid,", o["provider_pay
 at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["provider"]
 at.run()
-at.sidebar.radio[0].set_value("Orders Received").run()
+at.sidebar.radio(key="nav").set_value("Orders Received").run()
 at.button(key=f"adv{o['id']}").click().run()
 assert not at.exception, at.exception
 assert dict(hea.q("SELECT * FROM orders WHERE id=?", (o["id"],))[0])["status"] == "Accepted"
@@ -187,7 +195,7 @@ print("advance order .... ok")
 at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["customer"]
 at.run()
-at.sidebar.radio[0].set_value("My Orders").run()
+at.sidebar.radio(key="nav").set_value("My Orders").run()
 at.text_input(key=f"utr{o['id']}").set_value("UTR99887766")  # inside a form: submit, do not run
 at.button[[b.label for b in at.button].index("I've paid")].click().run()
 assert not at.exception, at.exception
@@ -198,7 +206,7 @@ print("claim payment .... ok")
 at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["admin"]
 at.run()
-at.sidebar.radio[0].set_value("Orders").run()
+at.sidebar.radio(key="nav").set_value("Orders").run()
 at.button(key=f"conf{o['id']}").click().run()
 assert not at.exception, at.exception
 assert dict(hea.q("SELECT * FROM orders WHERE id=?", (o["id"],))[0])["payment_status"] == "Paid"
@@ -211,7 +219,7 @@ print("escrow ........... ok  held until delivered, then ₹229.50 across 2 orde
 at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["admin"]
 at.run()
-at.sidebar.radio[0].set_value("Payouts").run()
+at.sidebar.radio(key="nav").set_value("Payouts").run()
 at.text_input(key=f"r{pid}").set_value("UPI-PAYOUT-4471")  # inside a form: submit, do not run
 at.button[[b.label for b in at.button].index("Record payout")].click().run()
 assert not at.exception, at.exception
@@ -241,7 +249,7 @@ print(f"whatsapp ......... ok  {len(msgs)} messages queued: {', '.join(sorted(se
 at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["admin"]
 at.run()
-at.sidebar.radio[0].set_value("WhatsApp Outbox").run()
+at.sidebar.radio(key="nav").set_value("WhatsApp Outbox").run()
 assert not at.exception, at.exception
 at.button(key=f"ms{msgs[0]['id']}").click().run()
 assert dict(hea.q("SELECT * FROM notifications WHERE id=?", (msgs[0]["id"],))[0])["status"] == "Sent"
@@ -297,6 +305,20 @@ assert at.session_state["user"]["linked_id"] == row["customer_id"]
 labels = [b.label for b in at.sidebar.button]
 assert not any(l.startswith("Become a helper") for l in labels), labels   # she already is one
 print("dual account ..... ok  customer became a helper on the same login, and switched back")
+
+# a suspended account is held at the door: a notice and the grievance contact, no pages
+hea.set_setting("grievance_name", "Asha R"); hea.set_setting("grievance_email", "grievance@gharse.example")
+held = USERS["provider"]
+hea.execute("UPDATE users SET suspended=1, suspended_reason=? WHERE id=?", ("Three reports under review", held["id"]))
+at = AppTest.from_file(APP, default_timeout=30)
+at.session_state["user"] = held
+at.run()
+assert not at.exception, at.exception
+page_text = " ".join(m.value for m in at.markdown)
+assert "on hold" in page_text and "Asha R" in page_text, page_text[:300]
+assert not [r for r in at.sidebar.radio if r.key == "nav"], "a held account must not reach any page"
+hea.execute("UPDATE users SET suspended=0, suspended_reason=NULL WHERE id=?", (held["id"],))
+print("suspension ....... ok  held account sees the notice and the grievance officer, nothing else")
 
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)

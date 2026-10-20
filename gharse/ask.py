@@ -404,7 +404,7 @@ def _my_asks(cust):
                     f"<span class='muted'>{eta}{note}</span>", unsafe_allow_html=True)
                 bc[1].markdown(f"<div class='price'>{h(_quote_price(b))}</div>", unsafe_allow_html=True)
                 if status == OPEN and b["status"] == "Offered":
-                    if care and not b["verified"]:
+                    if care and not care_cleared(b["provider_id"]):
                         # Care gate, customer side: an old quote, or one from a helper whose
                         # verification was withdrawn, can be read but never chosen.
                         bc[2].markdown("<span class='muted'>Not verified yet, so she can't be chosen "
@@ -444,6 +444,22 @@ def _my_asks(cust):
                 st.rerun()
 
 
+
+# ---- who may take a care ask -------------------------------------------------------------
+# Care work happens inside someone's home, with a child, an elder or a pet. The helper must be
+# verified by the team (providers.verified) AND her account must have passed identity
+# verification — phone OTP and KYC review (kyc.py). One SQL fragment, used by every atomic
+# write below, and one Python check for the screens, so the two can never disagree.
+def _care_ok(provider_ref):
+    return ("EXISTS (SELECT 1 FROM providers cv WHERE cv.id=" + provider_ref + " AND cv.verified=1 "
+            "AND EXISTS (SELECT 1 FROM users cu WHERE (cu.provider_id=cv.id OR "
+            "(cu.role='provider' AND cu.linked_id=cv.id)) "
+            "AND cu.kyc_status='verified' AND cu.phone_verified=1))")
+
+
+def care_cleared(provider_id):
+    return bool(q("SELECT 1 AS ok WHERE " + _care_ok("?"), (provider_id,)))
+
 def _quote_fp(b):
     """A short fingerprint of the quote as shown: price, note and when it was made."""
     raw = f"{b.get('price')}|{b.get('note')}|{b.get('eta')}|{b.get('created_at')}"
@@ -457,10 +473,10 @@ def _accept(cust, req, b):
     rid, bid_id = req["id"], b["id"]
     care = is_care(req)
     if care:
-        pv = q("SELECT verified FROM providers WHERE id=?", (b["provider_id"],))
-        if not pv or not pv[0]["verified"]:
+        if not care_cleared(b["provider_id"]):
             st.session_state["ask_flash"] = ("warn", f"{h(b.get('display_name') or 'This helper')} isn't verified "
-                                                     "by the GharSe team, so she can't be chosen for a care ask.")
+                                                     "by the GharSe team and by identity check, so she can't be "
+                                                     "chosen for a care ask.")
             return
     # 1. Claim the ask. Only one accept can move it out of Open.
     if not _claim("requests", ASSIGNED, rid, OPEN):
@@ -472,7 +488,7 @@ def _accept(cust, req, b):
     won = execute(
         "UPDATE bids SET status='Accepted' WHERE id=? AND request_id=? AND status='Offered' "
         "AND COALESCE(created_at, '')=? AND COALESCE(price, -1)=COALESCE(?, -1) "
-        "AND (?=0 OR EXISTS (SELECT 1 FROM providers p WHERE p.id=bids.provider_id AND p.verified=1)) "
+        "AND (?=0 OR " + _care_ok("bids.provider_id") + ") "
         "RETURNING id",
         (bid_id, rid, b.get("created_at") or "", b.get("price"), 1 if care else 0),
     )
@@ -550,7 +566,7 @@ def _open_asks(p):
     my_bids = {r["request_id"]: dict(r) for r in q(
         "SELECT b.* FROM bids b JOIN requests r ON r.id=b.request_id WHERE b.provider_id=? AND r.status=?",
         (p["id"], OPEN))}
-    verified = bool(p.get("verified"))
+    verified = care_cleared(p["id"])  # team-verified AND identity-verified
     shown_other_area = False
     for req in reqs:
         if req.get("area") != p.get("area") and not shown_other_area and p.get("area"):
@@ -572,8 +588,9 @@ def _open_asks(p):
                 st.markdown(
                     "<span class='pill warn'>Verification needed</span> <span class='muted'>Care asks mean "
                     "going into someone's home to look after a child, an elder or a pet, so only helpers the "
-                    "GharSe team has verified can quote. Finish verification under your profile and this "
-                    "opens up.</span>", unsafe_allow_html=True)
+                    "GharSe team has verified, and who have passed the identity check, can quote. Finish "
+                    "<b>Verify Identity</b> (phone code and ID review) and ask the team to verify your "
+                    "kitchen, and this opens up.</span>", unsafe_allow_html=True)
             else:
                 _quote_form(p, req, bid)
             # Outside the gate on purpose: a helper can always take back a quote she has
@@ -601,7 +618,7 @@ def _save_quote(p, req, bid, value, eta, note):
             "UPDATE bids SET price=?, eta=?, note=?, status='Offered', created_at=? "
             "WHERE id=? AND provider_id=? AND status IN ('Offered', 'Withdrawn') "
             "AND EXISTS (SELECT 1 FROM requests r WHERE r.id=bids.request_id AND r.status=?) "
-            "AND (?=0 OR EXISTS (SELECT 1 FROM providers v WHERE v.id=bids.provider_id AND v.verified=1)) "
+            "AND (?=0 OR " + _care_ok("bids.provider_id") + ") "
             "RETURNING id",
             (value, eta, note, now_iso(), bid["id"], p["id"], OPEN, care),
         )
@@ -613,7 +630,7 @@ def _save_quote(p, req, bid, value, eta, note):
         "CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT) "
         "WHERE EXISTS (SELECT 1 FROM requests r WHERE r.id=? AND r.status=?) "
         "AND NOT EXISTS (SELECT 1 FROM bids x WHERE x.request_id=? AND x.provider_id=?) "
-        "AND (?=0 OR EXISTS (SELECT 1 FROM providers v WHERE v.id=? AND v.verified=1)) "
+        "AND (?=0 OR " + _care_ok("?") + ") "
         "RETURNING id",
         (req["id"], p["id"], value, eta, note, "Offered", now_iso(),
          req["id"], OPEN, req["id"], p["id"], care, p["id"]),
@@ -679,7 +696,7 @@ def _my_quotes(p):
     if not rows:
         st.caption("You haven't quoted on anything yet. Quotes you send, and the asks you take up, show here.")
         return
-    verified = bool(p.get("verified"))
+    verified = care_cleared(p["id"])  # team-verified AND identity-verified
     for r in rows:
         d = dict(r)
         won = d["bid_status"] == "Accepted"
