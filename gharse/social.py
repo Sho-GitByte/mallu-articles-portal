@@ -198,7 +198,10 @@ def _get(row, key, default=None):
 # one of them and is never selected for a stranger-facing view: the display name comes
 # first — users.full_name, or the name sign-up wrote to the customer / helper profile —
 # then the login handle, then the caller's fallback (e.g. "A GharSe host").
-_NAME_KEYS = ("full_name", "cname", "pname", "username")
+# Rows that join an event or booking with its host carry the handle as `handle`, not
+# `username`: safety.is_suspended treats any row with a `username` as a users row and
+# would re-read it by the EVENT's id.
+_NAME_KEYS = ("full_name", "cname", "pname", "username", "handle")
 # Profile names for a users row aliased `u` (sign-up writes the name there, not to users).
 _PROFILE_NAMES = ("(SELECT c.full_name FROM customers c WHERE c.id = u.customer_id) cname, "
                   "(SELECT p.owner_name FROM providers p WHERE p.id = u.provider_id) pname")
@@ -325,8 +328,9 @@ REJECTED_MSG = ("Your earlier payment reference for this event couldn't be match
 
 # The account rules re-checked inside the statements: no second live booking on the same
 # event, and no new seats on an event where a claim of theirs was rejected.
-_ACCOUNT_FREE = ("NOT EXISTS (SELECT 1 FROM event_bookings b3 WHERE b3.event_id=? AND b3.user_id=? "
-                 "AND b3.id != ? AND (b3.status=? OR b3.payment_status='Rejected'))")
+_ACCOUNT_TAKEN = ("EXISTS (SELECT 1 FROM event_bookings b3 WHERE b3.event_id=? AND b3.user_id=? "
+                  "AND b3.id != ? AND (b3.status=? OR b3.payment_status='Rejected'))")
+_ACCOUNT_FREE = "NOT " + _ACCOUNT_TAKEN
 
 
 def _account_conflict_void(booking_id, event_id, user_id):
@@ -334,9 +338,8 @@ def _account_conflict_void(booking_id, event_id, user_id):
     voids this booking if the same account now has another live booking (or a rejected
     claim) on the event. If both racers see each other both are voided — nothing has been
     paid on a fresh hold, and it can never leave one account over the cap."""
-    return execute("UPDATE event_bookings SET status='Void' WHERE id=? AND status=? AND " + _ACCOUNT_FREE.replace(
-        "NOT EXISTS", "EXISTS", 1) + " RETURNING id",
-        (booking_id, ACTIVE, event_id, user_id, booking_id, ACTIVE)) is not None
+    return execute("UPDATE event_bookings SET status='Void' WHERE id=? AND status=? AND " + _ACCOUNT_TAKEN
+                   + " RETURNING id", (booking_id, ACTIVE, event_id, user_id, booking_id, ACTIVE)) is not None
 
 
 def reserve(event, user_id, qty):
@@ -839,7 +842,7 @@ def _visible_events(me):
     rows = q("SELECT e.id, e.host_user_id, e.kind, e.title, e.description, e.theme, e.rules, e.activities, "
              "e.interests, e.area, e.venue_hint, e.starts_at, e.ends_at, e.ticket_price, e.capacity, e.min_age, "
              "e.refund_rule, e.status, e.photo, "
-             "u.full_name, u.username, u.kyc_status, u.kyc_method, u.phone_verified, u.suspended, "
+             "u.full_name, u.username handle, u.kyc_status, u.kyc_method, u.phone_verified, u.suspended, "
              + _PROFILE_NAMES + " FROM events e JOIN users u ON u.id = e.host_user_id "
              "WHERE e.status='Published' AND e.starts_at > ? ORDER BY e.starts_at", (_now_iso(),))
     out = []
@@ -974,6 +977,10 @@ def _booking_panel(user, me, event_id, ctx):
         # None before that), so an age limit means a verified identity.
         if min_age and not kyc.require(me, f"join an event for ages {min_age}+"):
             return
+        if had_rejected(ev["id"], me["id"]):
+            st.markdown(f"<span class='pill warn'>Payment not found</span> {h(REJECTED_MSG)}<br>"
+                        f"{safety.grievance_line()}", unsafe_allow_html=True)
+            return
         if not _terms_ok(user, me, ctx):
             return
         if min_age:
@@ -989,9 +996,11 @@ def _booking_panel(user, me, event_id, ctx):
         if left <= 0:
             st.warning("Sold out — every seat is taken.")
             return
-        top_qty = min(left, MAX_SEATS_PER_BOOKING)
+        top_qty = min(left, seat_limit(ev))
         qty = st.number_input("Seats", 1, top_qty, 1, step=1, key=f"sb_qty{ev['id']}",
-                              help=f"Up to {top_qty}. Everyone you bring must meet the age limit.")
+                              help=f"Up to {top_qty}. Everyone you bring must meet the age limit."
+                              + (f" One account can hold at most {MAX_UNCONFIRMED_SEATS} paid seats while the "
+                                 "payment is being checked." if seat_limit(ev) == MAX_UNCONFIRMED_SEATS else ""))
         s = split_on_top((ev["ticket_price"] or 0) * int(qty))
         if s["customer_total"] > 0:
             st.markdown(breakdown(s, int(qty)), unsafe_allow_html=True)
@@ -1028,7 +1037,7 @@ def _booking_panel(user, me, event_id, ctx):
 def _my_bookings(user, me):
     rows = q("SELECT b.*, e.title, e.kind, e.theme, e.area, e.venue_hint, e.starts_at, e.ends_at, "
              "e.refund_rule, e.host_user_id, e.status ev_status, e.cancel_reason, e.ticket_price, e.capacity, "
-             "e.min_age, e.id ev_id, u.full_name, u.username, u.kyc_status, u.kyc_method, u.phone_verified, "
+             "e.min_age, e.id ev_id, u.full_name, u.username handle, u.kyc_status, u.kyc_method, u.phone_verified, "
              + _PROFILE_NAMES + " "
              "FROM event_bookings b JOIN events e ON e.id=b.event_id JOIN users u ON u.id=e.host_user_id "
              # A voided free seat (customer_total 0) was never the guest's, and they were already
@@ -1336,8 +1345,10 @@ def social_admin(admin_user):
     sweep_holds()
     _flash("sa_flash")
     claimed = [dict(r) for r in q(
-        "SELECT b.*, e.title, e.starts_at, e.host_user_id FROM event_bookings b JOIN events e ON e.id=b.event_id "
-        "WHERE b.payment_status='Claimed' ORDER BY b.id")]
+        "SELECT b.*, e.title, e.starts_at, e.host_user_id, "
+        "(SELECT COUNT(*) FROM event_bookings x WHERE x.user_id=b.user_id AND x.payment_status='Rejected') "
+        "rejected_n FROM event_bookings b JOIN events e ON e.id=b.event_id "
+        "WHERE b.payment_status='Claimed' ORDER BY b.created_at, b.id")]
     refunds = [dict(r) for r in q(
         "SELECT b.*, e.title, e.starts_at FROM event_bookings b JOIN events e ON e.id=b.event_id "
         "WHERE b.payment_status='Refund due' ORDER BY b.id")]
@@ -1368,8 +1379,8 @@ def social_admin(admin_user):
                     f" · <span class='pill warn'>{h(b['status'])} — confirming sends it to refunds</span>")
                 cc[0].markdown(
                     f"<b>Booking #{h(b['id'])} · {h(b['title'])} × {h(b['qty'])}</b>{note}<br>"
-                    f"<span class='muted'>{h(g['first'])} · {h(when(b['starts_at']))} · UTR {h(b['payment_ref'])}"
-                    "</span>", unsafe_allow_html=True)
+                    f"<span class='muted'>{h(g['first'])} (account #{h(b['user_id'])}) · {h(when(b['starts_at']))} · "
+                    f"UTR {h(b['payment_ref'])}</span><br>{_claim_flags(b)}", unsafe_allow_html=True)
                 cc[1].markdown(f"<div class='price'>{rs(b['customer_total'])}</div>", unsafe_allow_html=True)
                 bc = st.columns([1, 1, 3])
                 if bc[0].button("Confirm received", key=f"saconf{b['id']}", type="primary"):
@@ -1404,6 +1415,9 @@ def social_admin(admin_user):
     with tabs[1]:
         if not refunds:
             st.success("No refunds outstanding.")
+        else:
+            st.caption("Mark a refund only after sending the amount shown. If the amount changes before you "
+                       "click (say the host cancels the event), nothing is recorded and you're asked to recheck.")
         for b in refunds:
             g = _person(b["user_id"])
             with st.container(border=True):
@@ -1414,15 +1428,56 @@ def social_admin(admin_user):
                     f"{rs(b['customer_total'])} · UTR {h(b['payment_ref'] or '—')}</span>", unsafe_allow_html=True)
                 cc[1].markdown(f"<div class='price'>{rs(refund_of(b))}</div><span class='muted'>to refund</span>",
                                unsafe_allow_html=True)
-                if st.button("Mark refunded", key=f"sarefd{b['id']}"):
-                    ok = mark_refunded(b["id"])
-                    _set_flash("sa_flash", ok, f"Refund for booking #{b['id']} recorded."
-                               if ok else "Someone else already handled it.")
-                    st.rerun()
+                # The amount on screen travels with the click (callback args are bound when the
+                # button is drawn), so a figure that changed since is refused, not recorded.
+                st.button("Mark refunded", key=f"sarefd{b['id']}", on_click=_mark_refunded_click,
+                          args=(b["id"], refund_of(b)))
     with tabs[2]:
         _admin_payouts(owed)
     with tabs[3]:
         _admin_events()
+
+
+def _ago(ts):
+    t = _parse(ts)
+    if not t:
+        return "unknown"
+    mins = max(0, int((now_ist() - t).total_seconds() // 60))
+    if mins < 60:
+        return f"{mins} min"
+    hrs, mins = divmod(mins, 60)
+    if hrs < 48:
+        return f"{hrs} h {mins} min"
+    return f"{hrs // 24} days {hrs % 24} h"
+
+
+def _claim_flags(b):
+    """How long this claim has held its seats, and how many of this account's claims the
+    team has already found to be unpaid — so a squatter is easy to spot."""
+    t = _parse(b["created_at"])
+    late = t is not None and now_ist() - t > timedelta(hours=CLAIM_SLA_HOURS)
+    wait = (f"<span class='pill {'warn' if late else 'flat'}'>Waiting {h(_ago(b['created_at']))}</span>")
+    n = int(b.get("rejected_n") or 0)
+    rej = (f"<span class='pill warn'>{n} earlier claim{'s' if n != 1 else ''} rejected on this account</span>"
+           if n else "<span class='pill flat'>No rejected claims on this account</span>")
+    return f"{wait} {rej} <span class='muted'>· waiting counts from when the seats were booked</span>"
+
+
+def _mark_refunded_click(booking_id, seen):
+    if mark_refunded(booking_id, seen):
+        _set_flash("sa_flash", True, f"Refund of {rs(seen)} for booking #{booking_id} recorded.")
+        return
+    rows = q("SELECT * FROM event_bookings WHERE id=?", (booking_id,))
+    b = dict(rows[0]) if rows else None
+    if b and b["payment_status"] == "Refund due":
+        now_owed = refund_of(b)
+        extra = (f" If you already sent {rs(seen)}, send the remaining {rs(now_owed - seen)}, then mark it refunded."
+                 if now_owed > seen + 0.005 else "")
+        _set_flash("sa_flash", False, f"Nothing recorded: booking #{booking_id} now owes {rs(now_owed)}, not the "
+                                      f"{rs(seen)} you saw — it changed (for example the event was cancelled)."
+                                      + extra)
+    else:
+        _set_flash("sa_flash", False, "Someone else already handled it.")
 
 
 def _host_upi(host_id):

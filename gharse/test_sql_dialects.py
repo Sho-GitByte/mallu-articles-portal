@@ -101,19 +101,118 @@ def _fstring_parts(tree):
     return inner
 
 
-def sql_literals(path):
-    """Every SQL-looking string constant in a source file, found by parsing it —
-    never by hand-copying, so this cannot go stale. Schema templates are skipped
-    here because ddl_for() already checks them rendered, in both dialects."""
-    tree = ast.parse(open(path, encoding="utf-8").read())
+# A statement the app assembles with `+` — "... AND (" + _care_ok("?") + ") RETURNING id" —
+# is folded back into one string before it is parsed, so a shared fragment is checked inside
+# every statement that uses it. Pieces the folder can resolve: string constants, module-level
+# string constants (also another module's, as fssai.FOOD_OK_SQL), calls to a module-level
+# function whose body is a single return of a string expression, and `a if c else b` (the
+# longer branch, which is the one that adds SQL). Anything else (a variable,
+# " AND ".join(clauses)) stands in as a neutral boolean, which is what such pieces are.
+OPAQUE = "(1=1)"
+_UNRESOLVED = object()
+
+
+def _func_return(fn):
+    body = [n for n in fn.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    if len(body) == 1 and isinstance(body[0], ast.Return) and body[0].value is not None:
+        return body[0].value
+    return None
+
+
+class Folder:
+    def __init__(self, trees):
+        self.trees = trees                      # {"ask": tree, ...}
+        self.consts = {m: {} for m in trees}
+        self.funcs = {m: {} for m in trees}
+        for mod, tree in trees.items():
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    self.funcs[mod][node.name] = node
+        for mod, tree in trees.items():         # module order is enough for these files
+            for node in tree.body:
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)):
+                    v = self.value(node.value, mod, {})
+                    if isinstance(v, str):
+                        self.consts[mod][node.targets[0].id] = v
+
+    def value(self, node, mod, env, depth=0):
+        if depth > 8:
+            return _UNRESOLVED
+        if isinstance(node, ast.Constant):
+            return node.value if isinstance(node.value, str) else _UNRESOLVED
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = self.value(node.left, mod, env, depth + 1)
+            right = self.value(node.right, mod, env, depth + 1)
+            if isinstance(left, str) or isinstance(right, str):
+                return (left if isinstance(left, str) else OPAQUE) + \
+                       (right if isinstance(right, str) else OPAQUE)
+            return _UNRESOLVED
+        if isinstance(node, ast.IfExp):          # " AND p.area=?" if area else "" — the fuller branch
+            branches = [self.value(b, mod, env, depth + 1) for b in (node.body, node.orelse)]
+            branches = [b for b in branches if isinstance(b, str)]
+            return max(branches, key=len) if branches else _UNRESOLVED
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            return self.consts[mod].get(node.id, _UNRESOLVED)
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id in self.consts):
+            return self.consts[node.value.id].get(node.attr, _UNRESOLVED)
+        if isinstance(node, ast.Call) and not node.keywords:
+            target_mod, fn = mod, None
+            if isinstance(node.func, ast.Name):
+                fn = self.funcs[mod].get(node.func.id)
+            elif (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.funcs):
+                target_mod = node.func.value.id
+                fn = self.funcs[target_mod].get(node.func.attr)
+            ret = _func_return(fn) if fn is not None else None
+            if ret is None or fn.args.vararg or fn.args.kwarg or len(node.args) > len(fn.args.args):
+                return _UNRESOLVED
+            inner = {}
+            for param, arg in zip(fn.args.args, node.args):
+                v = self.value(arg, mod, env, depth + 1)
+                inner[param.arg] = v if isinstance(v, str) else OPAQUE
+            for param in fn.args.args[len(node.args):]:
+                inner[param.arg] = OPAQUE
+            return self.value(ret, target_mod, inner, depth + 1)
+        return _UNRESOLVED
+
+
+def _leftmost(node):
+    while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        node = node.left
+    return node
+
+
+def _is_sql(text):
+    return SQL_START.match(text) and SQL_BODY.search(text) and not TEMPLATE.search(text)
+
+
+def sql_literals(mod, tree, folder):
+    """Every SQL-looking string in a source file, found by parsing it — never by
+    hand-copying, so this cannot go stale. Schema templates are skipped here because
+    ddl_for() already checks them rendered, in both dialects."""
     inner = _fstring_parts(tree) | _docstrings(tree)
-    found = []
+    found, folded = [], set()
+    # Outermost `+` chains first; their constants are then part of a whole statement.
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)) or id(node) in folded:
+            continue
+        head = _leftmost(node)
+        if not (isinstance(head, ast.Constant) and isinstance(head.value, str)
+                and _is_sql(head.value) and id(head) not in inner):
+            continue
+        text = folder.value(node, mod, {})
+        if isinstance(text, str):
+            found.append((node.lineno, text))
+            for part in ast.walk(node):
+                folded.add(id(part))
     for node in ast.walk(tree):
         if (isinstance(node, ast.Constant) and isinstance(node.value, str)
-                and SQL_START.match(node.value)
-                and SQL_BODY.search(node.value)
-                and not TEMPLATE.search(node.value)
-                and id(node) not in inner):
+                and _is_sql(node.value) and id(node) not in inner and id(node) not in folded):
             found.append((node.lineno, node.value))
     return found
 
@@ -138,12 +237,11 @@ else:
 
 print("— queries in the source, parsed under both dialects")
 MODULES = sorted(f for f in os.listdir(ROOT) if f.endswith(".py") and not f.startswith(("test_", "smoke_")))
+TREES = {name[:-3]: ast.parse(open(os.path.join(ROOT, name), encoding="utf-8").read()) for name in MODULES}
+FOLDER = Folder(TREES)
 for name in MODULES:
-    path = os.path.join(ROOT, name)
-    literals = sql_literals(path)
+    literals = sql_literals(name[:-3], TREES[name[:-3]], FOLDER)
     for lineno, sql in literals:
-        # A query the app assembles from fragments is checked fragment-first: the
-        # opening fragment carries the statement, the rest are appended clauses.
         for dialect in ("sqlite", "postgres"):
             check(sql, dialect, f"{name}:{lineno}")
     print(f"  {name:9} {len(literals)} statements x 2 dialects")
