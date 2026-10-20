@@ -87,7 +87,39 @@ Messages then send themselves. Note that business-initiated messages outside Wha
 24-hour customer-service window need an approved template; the API's error shows in the Outbox
 rather than failing silently.
 
-## 6. Things to know once it is live
+## 6. SMS codes and identity checks
+
+Phone verification sends a six-digit code by SMS. Locally, on SQLite, the code is shown on screen
+in a red "demo mode" box so you can try it. **On Postgres no code is sent until SMS is set up** —
+the page says so, and nobody can verify a phone, which also means nobody can take a care ask,
+host a party or list a room. Set up one of these:
+
+```toml
+# MSG91 — the usual choice in India. Needs a DLT-registered OTP template.
+[sms]
+msg91_authkey = "..."
+msg91_template_id = "..."
+
+# or Twilio
+# [sms]
+# twilio_sid = "..."
+# twilio_token = "..."
+# twilio_from = "+1..."
+```
+
+Indian SMS must go through a DLT-registered sender and template (TRAI rules); MSG91 walks you
+through that registration, and it takes a few days, so start it early.
+
+`[kyc] demo_otp = true` turns the on-screen code back on for a Postgres copy you are only
+testing. Never set it on the live app — it lets anyone "verify" any number.
+
+Identity documents are checked **by people**, in **Admin → Social → KYC Queue**: the name, date of
+birth, masked PAN and last four of Aadhaar against a live selfie. The selfie is deleted when the
+team decides. `[kyc] vendor = "digilocker"` (or idfy, hyperverge, signzy, digio) records which
+eKYC partner you have signed with, but no partner is wired into the code yet — the page says so
+and the team keeps checking by hand until one is.
+
+## 7. Things to know once it is live
 
 - **The app sleeps.** After inactivity Community Cloud stops the container; the next visitor
   waits ~30 seconds for it to wake. With Postgres no data is lost — but a cook opening it at
@@ -99,7 +131,7 @@ rather than failing silently.
 - **Photos live in the database** as downscaled JPEGs. At 25 kitchens that is tens of MB and
   perfectly fine; at ten times that, move them to object storage.
 
-## 7. Before the first real rupee — the part no code can do
+## 8. Before the first real rupee — the part no code can do
 
 - [ ] **FSSAI registration** applied for by every kitchen selling food. The app blocks a food
       listing without a number on file, deliberately. Sit with each woman and fill the form
@@ -112,3 +144,10 @@ rather than failing silently.
 - [ ] **Each cook's UPI ID in her own name**, tested with a ₹1 transfer.
 - [ ] **A refund rule you can say in one sentence**, visible before a customer's first order.
 - [ ] **Someone's phone number** on the app for when something goes wrong at 1 PM.
+- [ ] **A grievance officer** — a named person in India, with an email and phone — entered under
+      **Fees & Settings**. The IT Rules 2021 require one; the app shows them on every Social page
+      and to anyone whose account is on hold.
+- [ ] **A lawyer's read on GharSe Social** before the first ticketed party: the disclaimer says the
+      platform only connects people, but whether that holds for an event GharSe takes a fee on is
+      a legal question, as are local rules on gatherings, noise and serving alcohol at home.
+- [ ] **SMS set up** (§6) and its DLT template approved.

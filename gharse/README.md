@@ -9,6 +9,9 @@ daily.
 Built for a first pilot in HSR Layout, Bengaluru: PG residents and office workers who want
 home-cooked lunch, and women a kilometre away who already know how to cook it.
 
+Beside the marketplace sits **GharSe Social**: house parties, meetups, trips and rooms to rent,
+between the same identity-checked neighbours, with the same login.
+
 ---
 
 ## Run it
@@ -33,20 +36,23 @@ python smoke_test.py         # every page, every role, and the whole money path
 python test_sql_dialects.py  # the SQL is valid for both SQLite and Postgres
 ```
 
-`smoke_test.py` renders every page for all three roles (30 today — the list is read from the
-app's own navigation, so it can never drift), then walks an order through place → pay → confirm
-→ deliver → payout and asserts the escrow rule holds, plus escaping, cancellation and the free
-pickup default. It prints `FAILURES: 0` when it is happy. CI runs both on every push.
+`smoke_test.py` renders every page for all three roles in both spaces (the list is read from
+the app's own navigation, so it can never drift), then walks an order through place → pay →
+confirm → deliver → payout and asserts the escrow rule holds, plus escaping, cancellation, the
+free pickup default, one account switching between customer and helper, and a suspended account
+being held at the door. It prints `FAILURES: 0` when it is happy. CI runs both on every push.
 
 ---
 
 ## Roles and pages
 
-| Role | Pages |
-|------|-------|
-| **Admin** (the platform) | Dashboard · Home Entrepreneurs · Listings · Price Guidance · Orders · Payouts · Subscriptions · Asks · Learn & Earn · WhatsApp Outbox · FSSAI Guide · Fees & Settings · My Profile |
-| **Helper** (a home entrepreneur) | My Kitchen · FSSAI Certificate · My Listings · Orders Received · Meal Plans & Subscribers · Neighbourhood Asks · Learn & Earn · My Earnings · FSSAI Guide · My Profile |
-| **Customer** | Discover Near Me · My Orders · My Subscriptions · Ask the Neighbourhood · Learn & Earn · My Preferences · My Profile |
+The sidebar opens on the **GharSe** marketplace; a switch at its top moves to **Social**.
+
+| Role | GharSe (marketplace) | Social |
+|------|----------------------|--------|
+| **Admin** (the platform) | Dashboard · Home Entrepreneurs · Listings · Price Guidance · Orders · Payouts · Subscriptions · Asks · Learn & Earn · WhatsApp Outbox · FSSAI Guide · Fees & Settings · My Profile | KYC Queue · Reports · Events Admin · Rentals Admin · My Profile |
+| **Helper** (a home entrepreneur) | My Kitchen · FSSAI Certificate · My Listings · Orders Received · Meal Plans & Subscribers · Neighbourhood Asks · Learn & Earn · My Earnings · FSSAI Guide · Verify Identity · My Profile | Events & Meetups · Rooms & PGs · Verify Identity · My Profile |
+| **Customer** | Discover Near Me · My Orders · My Subscriptions · Ask the Neighbourhood · Learn & Earn · My Preferences · Verify Identity · My Profile | Events & Meetups · Rooms & PGs · Verify Identity · My Profile |
 
 **One account can be both.** A customer can become a helper, and a helper can order from
 neighbours, from a button in the sidebar — same login, same identity checks, same theme. The
@@ -94,16 +100,51 @@ festival orders.
 **Ask the Neighbourhood.** Anyone can ask for anything a neighbour might do — nine groups and
 62 kinds of ask, from tiffin and jasmine stringing to saree embroidery, tuition, babysitting, elder
 care and pet care. Neighbours settle it with a fixed price, by offers, by exchange, or as free help.
-Care asks carry a safety note the asker must acknowledge, and only verified helpers can take them.
+Care asks carry a safety note the asker must acknowledge, and only a helper the team has verified
+*and* whose identity and phone are verified can take them.
 
 **Learn & Earn.** Neighbourhood jobs anyone can post or apply to, and skills to learn — each with
 YouTube tutorials, videos the team vouches for, and the women nearby who teach it, your own area
-first. Contact details are shared only once both sides accept.
+first. Contact details are shared only once both sides accept, and teaching in someone's home
+needs a verified identity.
 
 **My Profile and 20 themes.** Everyone has a profile — details, photo, password — and chooses from
 20 themes: five dark, five light, a rainbow Holi theme, four two-tone, four flower themes with
 stickers (jasmine, marigold, lotus, hibiscus) and a black-and-white one. Every theme is tested for
 readable contrast, light ones included.
+
+**Identity verification.** *Verify Identity* has three steps: prove the phone number with a
+one-time code, enter the details as on the ID, and take a live selfie that the team compares by
+hand in the **KYC Queue**. It asks for consent first (DPDP Act 2023) and keeps as little as it
+can: the **last four digits of Aadhaar only** — never the full number or a card image, which
+UIDAI rules forbid a platform like this to hold — the PAN stored masked, and the selfie deleted
+once the team has decided. Codes are stored hashed, expire in five minutes and are rate-limited;
+they go by SMS through MSG91 or Twilio once configured. A licensed eKYC partner (DigiLocker,
+IDfy, HyperVerge, Signzy, Digio) can be named in settings, but none is wired in yet and the app
+says so rather than inventing a result. Verification is required to take care asks, teach in a
+home, host or book a house party or trip, and list a room.
+
+**GharSe Social.** Verified members host house parties, friends meets, plan & play, hangouts and
+trips. A house party is ticketed — say ₹399 a seat, up to 50 guests, four hours. GharSe's 10% is
+added **on top** for the guest (8% platform + 2% processing), so the host keeps her whole price:
+a full ₹399 × 50 party pays her ₹19,950 and GharSe ₹1,995. Guests pay the platform UPI and claim
+with the reference; only then do they see the address and the host's phone. Hosts are paid only
+for confirmed seats, after the event has ended. Seat counts and payouts are single conditional
+statements, so two people racing for the last seat cannot both get it and a host cannot be paid
+twice. Each event states its refund rule; cancelling refunds by that rule, and a host calling an
+event off refunds everyone.
+
+**Rooms & PGs.** Advertise a room, a PG bed, a flat share or a whole flat. A card shows the rent,
+the owner's first name and badge — never the address or a phone. Requesting a visit is free;
+contact details and the exact address are shared only when the owner accepts. An optional booking
+amount works like a ticket: fees on top for the guest, the owner receives what she asked.
+
+**Safety.** Every Social page carries the platform's position in plain words: all members are
+identity-verified, GharSe only connects people, and personal safety rests with the individuals.
+Anyone can report or block anyone. Reports from three different members put an account on hold
+until the team reviews it under **Reports**; a held account sees why, and who to write to. The
+grievance officer required by the IT Rules 2021 is set under *Fees & Settings* and shown on every
+disclaimer. No sale of alcohol, no money changing hands outside the app.
 
 **WhatsApp.** Nine events message someone — new order, payment confirmed, every status change,
 cancellation, new quote, quote accepted, new subscription, payout sent. With Cloud API
@@ -118,6 +159,9 @@ Small modules with a one-way dependency graph: `app → pages → ui → store`.
 
 - **`app.py`** — the marketplace pages, navigation and the money (`split_money`, `payout_due`).
 - **`fssai.py`, `ask.py`, `learn.py`, `profile.py`** — one feature each. None imports `app.py`.
+- **`kyc.py`, `safety.py`** — identity verification, OTP and SMS; reports, blocks, holds and the
+  disclaimers.
+- **`social.py`, `rentals.py`** — events and rooms, the Social space.
 - **`themes.py`** — all styling: 20 themes as token sets, one stylesheet template.
 - **`ui.py`** — shared helpers: escaping, rupees, themed tables, photo handling, WhatsApp.
 - **`catalog.py`** — every fixed list: areas, categories, the ask groups, skills, event kinds.
