@@ -11,6 +11,11 @@ from html import escape as esc
 import pandas as pd
 
 import store
+from catalog import *  # noqa: F401,F403 — taxonomy constants (areas, categories, ask groups…)
+from ui import (MAX_IMG_MB, csv_join, csv_split, customer_of, df, h, hbar, idx, inr, kpi,
+                mask_phone, notify, notify_customer, notify_provider, photo_of, process_image,
+                provider_of, send_whatsapp, short_dt, table, today_iso, wa_credentials, wa_link,
+                wa_number)
 from store import (DEFAULT_SETTINGS, admin_password_is_default, execute, hash_pw, init_db,
                    needs_rehash, now_ist, now_iso, q, set_setting, setting, today_ist, verify_pw)
 
@@ -24,59 +29,6 @@ st.set_page_config(
 
 DB_PATH = "gharse.db"
 
-KINDS = ["Food", "Product", "Service"]
-
-CATEGORIES = {
-    "Food": [
-        "Daily Meal (Veg)", "Daily Meal (Non-Veg)", "Breakfast", "Snacks & Tiffin",
-        "Biryani & Rice", "Curries & Sides", "Sweets & Bakes", "Pickles & Masala",
-        "Festival / Bulk Order", "Diet / High-Protein", "Kids Meal", "Elderly Meal",
-    ],
-    "Product": [
-        "Flowers & Garlands", "Tailoring & Stitching", "Saree Work & Embroidery",
-        "Handloom", "Handicraft & Decor", "Artificial Jewellery", "Candles & Soaps",
-        "Gifts & Hampers", "Knitting & Crochet",
-    ],
-    "Service": [
-        "Alterations", "Ironing & Laundry", "Mehendi", "Beauty at Home",
-        "Tuition", "Day-care / Baby-sitting", "Event Cooking", "Packing & Assembly",
-        "Petty Home Chores",
-    ],
-}
-
-CUISINES = [
-    "South Indian", "North Indian", "Bengali", "Assamese / North-East", "Kerala",
-    "Karnataka", "Andhra", "Tamil", "Hyderabadi", "Maharashtrian", "Gujarati / Jain",
-    "Chinese / Indo-Chinese", "Other",
-]
-
-DIETS = ["Vegetarian", "Non-Vegetarian", "Egg only", "Jain", "No preference"]
-SPICE = ["Mild", "Medium", "Spicy"]
-
-AREAS = [
-    "HSR Layout", "Koramangala", "BTM Layout", "Bellandur", "Marathahalli",
-    "Whitefield", "Electronic City", "Indiranagar", "Jayanagar", "JP Nagar",
-    "Banashankari", "Rajajinagar", "Malleshwaram", "Yelahanka", "Hebbal",
-    "CBD / MG Road", "Other",
-]
-
-LANGUAGES = ["Kannada", "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Bengali", "Marathi", "Assamese"]
-
-SLOTS = ["Breakfast (7–10 AM)", "Lunch (12–2:30 PM)", "Evening (4–6 PM)", "Dinner (7–9:30 PM)", "Anytime"]
-UNITS = ["per meal", "per plate", "per piece", "per kg", "per dozen", "per set", "per hour", "per job"]
-
-DELIVERY_MODES = ["Home delivery", "Community pickup point", "Self pickup"]
-
-ORDER_FLOW = ["Placed", "Accepted", "Preparing", "Ready", "Out for delivery", "Delivered"]
-ORDER_STATUSES = ORDER_FLOW + ["Cancelled"]
-
-REQUEST_STATUSES = ["Open", "Assigned", "Completed", "Cancelled"]
-BID_STATUSES = ["Offered", "Accepted", "Declined"]
-
-PLAN_PERIODS = [7, 15, 26, 30]
-
-PAYMENT_STATUSES = ["Unpaid", "Claimed", "Paid", "Refund due", "Refunded"]
-
 
 # ----------------------------------------------------------------------------- DATA
 # Schema, migrations, connection handling, password hashing and IST time all live in
@@ -84,29 +36,7 @@ PAYMENT_STATUSES = ["Unpaid", "Claimed", "Paid", "Refund due", "Refunded"]
 # writes plain SQL with ? placeholders and never touches a driver.
 
 # ----------------------------------------------------------------------------- HELPERS
-def idx(lst, val, default=0):
-    return lst.index(val) if val in lst else default
 
-def csv_join(items):
-    return ", ".join(items) if items else ""
-
-def csv_split(s):
-    return [x.strip() for x in (s or "").split(",") if x.strip()]
-
-def inr(n):
-    n = int(round(n or 0))
-    s = str(abs(n))
-    if len(s) > 3:
-        last3, rest = s[-3:], s[:-3]
-        rest = re.sub(r"(?<=\d)(?=(\d\d)+$)", ",", rest)
-        s = rest + "," + last3
-    return ("-" if n < 0 else "") + "₹" + s
-
-def mask_phone(p):
-    d = "".join(ch for ch in (p or "") if ch.isdigit())
-    if len(d) < 4:
-        return "•••• (shared after order)"
-    return d[:2] + "•" * (len(d) - 4) + d[-2:]
 
 def delivery_fee_for(mode):
     return {
@@ -190,74 +120,6 @@ def pay_pill(status):
     cls = {"Paid": "ok", "Claimed": "", "Unpaid": "warn", "Refund due": "warn", "Refunded": ""}.get(status, "")
     return f"<span class='pill {cls}'>{status}</span>"
 
-# ----------------------------------------------------------------------------- WHATSAPP
-# Two delivery paths. With Cloud API credentials in the environment, messages send
-# themselves. Without them — which is where a pilot starts — every message is queued
-# and sent by one click from the Outbox, which needs no Meta account at all.
-def wa_number(phone):
-    d = "".join(ch for ch in (phone or "") if ch.isdigit())
-    if len(d) == 10:
-        d = "91" + d
-    return d if len(d) >= 11 else ""
-
-def wa_link(phone, body):
-    from urllib.parse import quote
-    n = wa_number(phone)
-    return f"https://wa.me/{n}?text={quote(body)}" if n else None
-
-def wa_credentials():
-    import os
-    tok, phone_id = os.environ.get("WHATSAPP_TOKEN"), os.environ.get("WHATSAPP_PHONE_ID")
-    if not (tok and phone_id):
-        try:
-            tok = tok or st.secrets.get("WHATSAPP_TOKEN")
-            phone_id = phone_id or st.secrets.get("WHATSAPP_PHONE_ID")
-        except Exception:
-            pass
-    return tok, phone_id
-
-def send_whatsapp(phone, body):
-    """Returns (sent, error). Business-initiated messages outside the 24-hour customer
-    service window need an approved template — the API error is stored, not hidden."""
-    tok, phone_id = wa_credentials()
-    n = wa_number(phone)
-    if not (tok and phone_id):
-        return False, "no API credentials — send from the Outbox"
-    if not n:
-        return False, "no usable phone number"
-    try:
-        import requests
-        r = requests.post(
-            f"https://graph.facebook.com/v20.0/{phone_id}/messages",
-            headers={"Authorization": f"Bearer {tok}"},
-            json={"messaging_product": "whatsapp", "to": n, "type": "text", "text": {"body": body}},
-            timeout=15,
-        )
-        if r.status_code < 300:
-            return True, None
-        return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    except Exception as e:
-        return False, str(e)[:200]
-
-def notify(phone, name, role, kind, body, order_id=None):
-    now = now_iso()
-    sent, err = send_whatsapp(phone, body)
-    execute(
-        "INSERT INTO notifications (to_phone, to_name, to_role, kind, body, order_id, status, error, "
-        "sent_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (phone, name, role, kind, body, order_id, "Sent" if sent else "Queued", err,
-         now if sent else None, now),
-    )
-
-def notify_provider(provider_id, kind, body, order_id=None):
-    rows = q("SELECT display_name, phone FROM providers WHERE id=?", (provider_id,))
-    if rows:
-        notify(rows[0]["phone"], rows[0]["display_name"], "provider", kind, body, order_id)
-
-def notify_customer(customer_id, kind, body, order_id=None):
-    rows = q("SELECT full_name, phone FROM customers WHERE id=?", (customer_id,))
-    if rows:
-        notify(rows[0]["phone"], rows[0]["full_name"], "customer", kind, body, order_id)
 
 def authenticate(u, p):
     rows = q("SELECT * FROM users WHERE username=?", (u,))
@@ -279,13 +141,6 @@ def note_attempt(username, ok):
     tries = st.session_state.setdefault("login_tries", {})
     tries[username] = 0 if ok else tries.get(username, 0) + 1
 
-def provider_of(user):
-    rows = q("SELECT * FROM providers WHERE id=?", (user["linked_id"],))
-    return dict(rows[0]) if rows else {}
-
-def customer_of(user):
-    rows = q("SELECT * FROM customers WHERE id=?", (user["linked_id"],))
-    return dict(rows[0]) if rows else {}
 
 def can_sell_food(p):
     """Food is the one category we gate: verified provider + an FSSAI number on file."""
@@ -303,98 +158,6 @@ def repeat_customers(pid):
     )
     return rows[0]["c"]
 
-def h(v):
-    """Escape a database value on its way into unsafe_allow_html markup. A kitchen
-    called "Amma's" must not break the page, and a review containing a script tag
-    must never run."""
-    return esc("" if v is None else str(v), quote=True)
-
-def df(rows):
-    return pd.DataFrame([dict(r) for r in rows])
-
-def short_dt(v):
-    try:
-        return datetime.fromisoformat(str(v)).strftime("%d %b, %H:%M")
-    except (TypeError, ValueError):
-        return str(v)
-
-def table(rows, cols=None, money=(), empty="Nothing yet."):
-    """Render as HTML so the table follows this app's theme, not Streamlit's own."""
-    from html import escape
-    data = [dict(r) for r in rows]
-    if not data:
-        st.caption(empty)
-        return
-    cols = cols or list(data[0].keys())
-    head = "".join(f"<th>{escape(c.replace('_', ' '))}</th>" for c in cols)
-    body = ""
-    for d in data:
-        cells = ""
-        for c in cols:
-            v = d.get(c)
-            if v is None or v == "":
-                cells += "<td class='muted'>—</td>"
-            elif c in money:
-                cells += f"<td class='num'>{inr(v)}</td>"
-            elif c.endswith("_at"):
-                cells += f"<td>{escape(short_dt(v))}</td>"
-            elif isinstance(v, bool):
-                cells += f"<td>{'yes' if v else 'no'}</td>"
-            elif isinstance(v, (int, float)):
-                cells += f"<td class='num'>{v:g}</td>"
-            else:
-                cells += f"<td>{escape(str(v))}</td>"
-        body += f"<tr>{cells}</tr>"
-    st.markdown(f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
-                f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
-
-def hbar(rows, label_key, value_key, empty="No data yet."):
-    from html import escape
-    data = [dict(r) for r in rows]
-    if not data:
-        st.caption(empty)
-        return
-    top = max((d[value_key] or 0) for d in data) or 1
-    html = ""
-    for d in data:
-        v = d[value_key] or 0
-        html += (f"<div class='hb'><div class='hb-l'>{escape(str(d[label_key]))}</div>"
-                 f"<div class='hb-t'><div class='hb-f' style='width:{100 * v / top:.1f}%'></div></div>"
-                 f"<div class='hb-v'>{v:g}</div></div>")
-    st.markdown(html, unsafe_allow_html=True)
-
-MAX_IMG_MB = 5
-
-def process_image(uploaded, max_px=900):
-    """Downscale an upload so the database stays small. Falls back to the raw bytes
-    if Pillow is unavailable — a slightly heavy row beats a lost photo."""
-    if uploaded is None:
-        return None
-    raw = uploaded.getvalue()
-    if not raw:
-        return None
-    try:
-        import io
-        from PIL import Image
-        im = Image.open(io.BytesIO(raw))
-        if im.mode in ("RGBA", "P", "LA"):
-            im = im.convert("RGB")
-        im.thumbnail((max_px, max_px))
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=82)
-        return buf.getvalue()
-    except Exception:
-        return raw
-
-def photo_of(row, fallback=None):
-    """Listing photo, else the kitchen's own photo, else nothing."""
-    for candidate in (row.get("photo") if isinstance(row, dict) else None, fallback):
-        if candidate:
-            return bytes(candidate)
-    return None
-
-def today_iso():
-    return today_ist().isoformat()
 
 # ----------------------------------------------------------------------------- THEME / CSS
 def inject_css():
@@ -557,11 +320,6 @@ def inject_css():
         unsafe_allow_html=True,
     )
 
-def kpi(col, label, value):
-    col.markdown(
-        f"<div class='kpi'><div class='k-label'>{label}</div><div class='k-val'>{value}</div></div>",
-        unsafe_allow_html=True,
-    )
 
 def money_split_caption(s):
     return (

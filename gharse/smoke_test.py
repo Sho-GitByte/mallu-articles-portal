@@ -186,7 +186,7 @@ at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["customer"]
 at.run()
 at.sidebar.radio[0].set_value("My Orders").run()
-at.text_input(key=f"utr{o['id']}").set_value("UTR99887766").run()
+at.text_input(key=f"utr{o['id']}").set_value("UTR99887766")  # inside a form: submit, do not run
 at.button[[b.label for b in at.button].index("I've paid")].click().run()
 assert not at.exception, at.exception
 paid = dict(hea.q("SELECT * FROM orders WHERE id=?", (o["id"],))[0])
@@ -210,7 +210,7 @@ at = AppTest.from_file(APP, default_timeout=30)
 at.session_state["user"] = USERS["admin"]
 at.run()
 at.sidebar.radio[0].set_value("Payouts").run()
-at.text_input(key=f"r{pid}").set_value("UPI-PAYOUT-4471").run()
+at.text_input(key=f"r{pid}").set_value("UPI-PAYOUT-4471")  # inside a form: submit, do not run
 at.button[[b.label for b in at.button].index("Record payout")].click().run()
 assert not at.exception, at.exception
 assert hea.payout_due(pid)[0] == 0.0, hea.payout_due(pid)

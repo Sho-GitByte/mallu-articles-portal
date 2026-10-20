@@ -137,7 +137,8 @@ else:
           f"{sum(len(v) for v in shape_sqlite.values())} columns")
 
 print("— queries in the source, parsed under both dialects")
-for name in ("app.py", "store.py"):
+MODULES = sorted(f for f in os.listdir(ROOT) if f.endswith(".py") and not f.startswith(("test_", "smoke_")))
+for name in MODULES:
     path = os.path.join(ROOT, name)
     literals = sql_literals(path)
     for lineno, sql in literals:
@@ -151,7 +152,7 @@ for name in ("app.py", "store.py"):
 # their own, but they must still be dialect-neutral.
 print("— appended query fragments")
 frag_bad = 0
-for name in ("app.py", "store.py"):
+for name in MODULES:
     tree = ast.parse(open(os.path.join(ROOT, name), encoding="utf-8").read())
     inner = _fstring_parts(tree) | _docstrings(tree)
     for node in ast.walk(tree):

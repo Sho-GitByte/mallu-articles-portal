@@ -161,7 +161,8 @@ def q(sql, params=()):
 # Tables whose INSERTs hand back a new id. settings is keyed by its own text key and
 # has no id column, so it must never get a RETURNING clause.
 _ID_TABLES = {"users", "providers", "customers", "listings", "orders", "plans",
-              "subscriptions", "requests", "bids", "payouts", "notifications"}
+              "subscriptions", "requests", "bids", "payouts", "notifications",
+              "jobs", "job_applications", "skill_offers", "learn_requests", "skill_links"}
 _INSERT_RE = re.compile(r"^\s*INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
 
 def execute(sql, params=()):
@@ -188,6 +189,7 @@ SCHEMA = [
         pw_hash TEXT NOT NULL,
         role TEXT NOT NULL,
         linked_id INTEGER,
+        theme TEXT, full_name TEXT, phone TEXT, email TEXT, bio TEXT, photo {BLOB},
         created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS providers (
@@ -199,6 +201,8 @@ SCHEMA = [
         fssai_no TEXT, kyc_done INTEGER DEFAULT 0, hygiene_done INTEGER DEFAULT 0,
         verified INTEGER DEFAULT 0, verify_note TEXT,
         photo {BLOB}, upi_id TEXT,
+        fssai_status TEXT, fssai_kind TEXT, fssai_arn TEXT, fssai_expiry TEXT,
+        fssai_cert {BLOB}, fssai_cert_mime TEXT,
         created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS customers (
@@ -239,7 +243,9 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS requests (
         id {PK},
         customer_id INTEGER, kind TEXT, category TEXT, title TEXT, description TEXT,
-        area TEXT, budget {MONEY}, needed_by TEXT, status TEXT, created_at TEXT
+        area TEXT, budget {MONEY}, needed_by TEXT, status TEXT,
+        ask_group TEXT, consideration TEXT, safety_ack INTEGER DEFAULT 0,
+        created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS bids (
         id {PK},
@@ -260,6 +266,35 @@ SCHEMA = [
         provider_id INTEGER, amount {MONEY}, orders_count INTEGER,
         method TEXT, ref TEXT, note TEXT, created_at TEXT
     )""",
+    # Learn & Earn — neighbourhood jobs. Anyone can post (a customer needing a part-time
+    # cook, a cook needing a helper, the platform itself) and anyone can apply.
+    """CREATE TABLE IF NOT EXISTS jobs (
+        id {PK},
+        poster_user_id INTEGER, title TEXT, kind TEXT, category TEXT, description TEXT,
+        pay {MONEY}, pay_unit TEXT, hours TEXT, area TEXT, starts TEXT,
+        status TEXT, created_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS job_applications (
+        id {PK},
+        job_id INTEGER, applicant_user_id INTEGER, note TEXT, status TEXT, created_at TEXT
+    )""",
+    # A neighbour offering to teach what she knows — tailoring, mehendi, baking.
+    """CREATE TABLE IF NOT EXISTS skill_offers (
+        id {PK},
+        teacher_user_id INTEGER, skill TEXT, level TEXT, mode TEXT,
+        fee {MONEY}, fee_unit TEXT, area TEXT, languages TEXT, about TEXT,
+        active INTEGER DEFAULT 1, created_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS learn_requests (
+        id {PK},
+        offer_id INTEGER, learner_user_id INTEGER, note TEXT, status TEXT, created_at TEXT
+    )""",
+    # Training videos the team has actually watched and vouches for, per skill.
+    """CREATE TABLE IF NOT EXISTS skill_links (
+        id {PK},
+        skill TEXT, title TEXT, url TEXT, source TEXT, language TEXT,
+        added_by INTEGER, created_at TEXT
+    )""",
     """CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value TEXT
     )""",
@@ -277,12 +312,23 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_notifications_status ON notifications (status)",
     "CREATE INDEX IF NOT EXISTS ix_payouts_provider ON payouts (provider_id)",
     "CREATE INDEX IF NOT EXISTS ix_bids_request ON bids (request_id)",
+    "CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs (status, area)",
+    "CREATE INDEX IF NOT EXISTS ix_job_apps_job ON job_applications (job_id)",
+    "CREATE INDEX IF NOT EXISTS ix_offers_skill ON skill_offers (skill, area)",
+    "CREATE INDEX IF NOT EXISTS ix_learn_offer ON learn_requests (offer_id)",
+    "CREATE INDEX IF NOT EXISTS ix_links_skill ON skill_links (skill)",
 ]
 
 # Columns added after the first release. Kept so a database created by an earlier
 # version keeps working instead of needing a wipe.
 NEW_COLUMNS = {
-    "providers": {"photo": "{BLOB}", "upi_id": "TEXT"},
+    "users": {"theme": "TEXT", "full_name": "TEXT", "phone": "TEXT", "email": "TEXT",
+              "bio": "TEXT", "photo": "{BLOB}"},
+    "providers": {"photo": "{BLOB}", "upi_id": "TEXT",
+                  "fssai_status": "TEXT", "fssai_kind": "TEXT", "fssai_arn": "TEXT",
+                  "fssai_expiry": "TEXT", "fssai_cert": "{BLOB}", "fssai_cert_mime": "TEXT"},
+    "requests": {"ask_group": "TEXT", "consideration": "TEXT",
+                 "safety_ack": "INTEGER DEFAULT 0"},
     "listings": {"photo": "{BLOB}", "cost_price": "{MONEY}"},
     "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT",
                "ops_fee": "{MONEY} DEFAULT 0"},
