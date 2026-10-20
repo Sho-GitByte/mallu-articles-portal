@@ -273,5 +273,30 @@ for nasty in ["Amma's <script>alert(1)</script>", "[Win ₹500](http://evil.exam
 assert "&&#" not in hea.h("Amma's"), "escaped twice"
 print("escaping ......... ok  markup in DB text cannot reach the page")
 
+# one account, both sides: a customer becomes a helper, then switches back
+cust_row = dict(hea.q("SELECT * FROM users WHERE role='customer'")[0])
+assert not cust_row.get("provider_id"), cust_row
+at = AppTest.from_file(APP, default_timeout=30)
+at.session_state["user"] = hea.session_user(cust_row)
+at.run()
+assert not at.exception, at.exception
+become = next(b for b in at.sidebar.button if b.label.startswith("Become a helper"))
+become.click().run()
+assert not at.exception, at.exception
+row = dict(hea.q("SELECT * FROM users WHERE id=?", (cust_row["id"],))[0])
+assert row["provider_id"] and row["customer_id"], row
+me = at.session_state["user"]
+assert me["role"] == "provider" and me["linked_id"] == row["provider_id"], me
+assert me["has_customer"] and me["has_provider"], me
+kitchen = dict(hea.q("SELECT * FROM providers WHERE id=?", (row["provider_id"],))[0])
+assert kitchen["area"] == "HSR Layout", kitchen        # carried over from the customer side
+at.sidebar.radio(key="mode_pick").set_value("customer").run()
+assert not at.exception, at.exception
+assert at.session_state["user"]["role"] == "customer"
+assert at.session_state["user"]["linked_id"] == row["customer_id"]
+labels = [b.label for b in at.sidebar.button]
+assert not any(l.startswith("Become a helper") for l in labels), labels   # she already is one
+print("dual account ..... ok  customer became a helper on the same login, and switched back")
+
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)

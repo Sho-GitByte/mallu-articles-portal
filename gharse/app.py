@@ -157,6 +157,13 @@ def add_side(user, mode):
     starts ordering. Same login, same identity checks, same theme."""
     me = dict(q("SELECT * FROM users WHERE id=?", (user["id"],))[0])
     now = now_iso()
+    # Make sure the side the account already has is recorded too. Accounts from before dual
+    # roles carry it only in linked_id until startup backfills it; write it here as well,
+    # so the two sides can never end up half-recorded.
+    own = {"provider": "provider_id", "customer": "customer_id"}.get(me["role"])
+    if own and not me.get(own) and me.get("linked_id"):
+        execute(f"UPDATE users SET {own}=? WHERE id=?", (me["linked_id"], me["id"]))
+        me[own] = me["linked_id"]
     if mode == "provider" and not me.get("provider_id"):
         c = customer_of(user) if user["role"] == "customer" else {}
         pid = execute("INSERT INTO providers (display_name, owner_name, phone, area, created_at) "
