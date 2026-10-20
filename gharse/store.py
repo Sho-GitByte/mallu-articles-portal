@@ -37,6 +37,10 @@ DEFAULT_SETTINGS = {
     "pickup_point_fee": "0",     # a batched drop at a PG / office / apartment gate
     "self_pickup_fee": "0",
     "min_order": "60",
+    # The grievance officer the IT Rules 2021 require an intermediary to name and publish.
+    "grievance_name": "",
+    "grievance_email": "",
+    "grievance_phone": "",
 }
 
 DEMO_ADMIN_PASSWORD = "admin@123"
@@ -199,6 +203,7 @@ SCHEMA = [
         pan_masked TEXT, aadhaar_last4 TEXT, kyc_selfie {BLOB},
         kyc_consent_at TEXT, kyc_submitted_at TEXT, kyc_reviewed_at TEXT,
         kyc_reviewed_by INTEGER, kyc_note TEXT,
+        suspended INTEGER DEFAULT 0, suspended_reason TEXT, social_terms_at TEXT,
         created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS providers (
@@ -329,7 +334,8 @@ SCHEMA = [
         host_user_id INTEGER, kind TEXT, title TEXT, description TEXT, theme TEXT,
         rules TEXT, activities TEXT, interests TEXT, area TEXT, venue_hint TEXT,
         address TEXT, starts_at TEXT, ends_at TEXT, ticket_price {MONEY}, capacity INTEGER,
-        min_age INTEGER DEFAULT 18, refund_rule TEXT, status TEXT, photo {BLOB}, created_at TEXT
+        min_age INTEGER DEFAULT 18, refund_rule TEXT, status TEXT, photo {BLOB},
+        host_ack INTEGER DEFAULT 0, cancel_reason TEXT, created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS event_bookings (
         id {PK},
@@ -402,7 +408,8 @@ NEW_COLUMNS = {
               "kyc_status": "TEXT", "kyc_method": "TEXT", "kyc_ref": "TEXT", "kyc_name": "TEXT",
               "dob": "TEXT", "pan_masked": "TEXT", "aadhaar_last4": "TEXT", "kyc_selfie": "{BLOB}",
               "kyc_consent_at": "TEXT", "kyc_submitted_at": "TEXT", "kyc_reviewed_at": "TEXT",
-              "kyc_reviewed_by": "INTEGER", "kyc_note": "TEXT"},
+              "kyc_reviewed_by": "INTEGER", "kyc_note": "TEXT",
+              "suspended": "INTEGER DEFAULT 0", "suspended_reason": "TEXT", "social_terms_at": "TEXT"},
     "providers": {"photo": "{BLOB}", "upi_id": "TEXT",
                   "fssai_status": "TEXT", "fssai_kind": "TEXT", "fssai_arn": "TEXT",
                   "fssai_expiry": "TEXT", "fssai_cert": "{BLOB}", "fssai_cert_mime": "TEXT",
