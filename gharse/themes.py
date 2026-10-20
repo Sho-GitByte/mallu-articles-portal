@@ -24,6 +24,8 @@
 #   strong               big numbers (.price, KPI values)
 #   input, input2, popover  input ground, step-button/radio ground, dropdown ground
 #   btn_bg, btn_txt      button fill (any CSS background) and its label colour
+#   btn_solid            the flat colour (accent or accent_deep) btn_txt reads best on;
+#                        fills the calendar's selected day
 #   bar_bg               fill of the horizontal bar chart
 #   brand_fill, brand_color  brand-mark accent: background (clipped to text) + colour
 #   ok, ok_rgb, warn, warn_rgb  status colours (text) and their tint channels
@@ -42,7 +44,7 @@ GROUP_BLURBS = {
     "Rainbow": "Every colour of Holi at once.",
     "Two-tone": "Two colours that share the work.",
     "Flowers": "A soft scatter of your favourite flower behind the page.",
-    "Mono": "Pure black and white, nothing else.",
+    "Mono": "Black and white throughout; only alerts keep their colour.",
 }
 
 TOKEN_KEYS = [
@@ -53,7 +55,7 @@ TOKEN_KEYS = [
     "accent", "accent_deep", "accent2", "accent_rgb", "hi_rgb",
     "txt", "txt2", "muted", "strong",
     "input", "input2", "popover",
-    "btn_bg", "btn_txt", "bar_bg", "brand_fill", "brand_color",
+    "btn_bg", "btn_txt", "btn_solid", "bar_bg", "brand_fill", "brand_color",
     "ok", "ok_rgb", "warn", "warn_rgb", "shadow", "shadow2",
 ]
 
@@ -62,7 +64,22 @@ RAINBOW = ["#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#4dabf7", "#b197fc"]
 
 def _rgb(hex_colour):
     h = hex_colour.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
     return ",".join(str(int(h[i:i + 2], 16)) for i in (0, 2, 4))
+
+
+def _lum(hex_colour):
+    def ch(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (ch(int(x)) for x in _rgb(hex_colour).split(","))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(a, b):
+    la, lb = _lum(a), _lum(b)
+    return (max(la, lb) + .05) / (min(la, lb) + .05)
 
 
 def _theme(key, name, group, dark, sticker=None, sticker_tint=None, **t):
@@ -76,6 +93,7 @@ def _theme(key, name, group, dark, sticker=None, sticker_tint=None, **t):
     t.setdefault("popover", t["sidebar"])
     t.setdefault("btn_bg", f"linear-gradient(135deg, {t['accent_deep']} 0%, {t['accent']} 100%)")
     t.setdefault("bar_bg", f"linear-gradient(90deg,{t['accent_deep']},{t['accent2']})")
+    t.setdefault("btn_solid", max((t["accent"], t["accent_deep"]), key=lambda c: _contrast(c, t["btn_txt"])))
     t.setdefault("brand_fill", "none")
     t.setdefault("brand_color", t["accent2"])
     t.setdefault("ok_rgb", _rgb(t["ok"]))
@@ -150,35 +168,35 @@ THEMES = [
            accent="#b45309", accent_deep="#92400e", accent2="#9a3412",
            txt="#2a1d10", txt2="#6b5440", strong="#1a1008",
            input="#ffffff", input2="#f3e8d6", popover="#ffffff",
-           btn_txt="#ffffff", ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           btn_txt="#ffffff", ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("monsoon-mist", "Monsoon Mist", "Light", False,
            bg="#f3f6fa", bg2="#eaf0f7", glow="#d8e6fb", sidebar="#e4ecf6", sidebar2="#f3f6fa",
            panel="rgba(255,255,255,0.8)", line="rgba(29,78,216,0.18)",
            accent="#1d4ed8", accent_deep="#1e40af", accent2="#1e3a8a",
            txt="#0f1b2d", txt2="#475a73", strong="#0b1424",
            input="#ffffff", input2="#e4ecf6", popover="#ffffff",
-           btn_txt="#ffffff", ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           btn_txt="#ffffff", ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("mint-leaf", "Mint Leaf", "Light", False,
            bg="#f2f8f4", bg2="#e8f3ec", glow="#d2eedc", sidebar="#e2f0e7", sidebar2="#f2f8f4",
            panel="rgba(255,255,255,0.8)", line="rgba(4,120,87,0.20)",
            accent="#047857", accent_deep="#065f46", accent2="#065f46",
            txt="#0f2318", txt2="#476153", strong="#08170f",
            input="#ffffff", input2="#e2f0e7", popover="#ffffff",
-           btn_txt="#ffffff", ok="#14532d", warn="#b91c1c", warn_rgb="220,38,38"),
+           btn_txt="#ffffff", ok="#14532d", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("rose-quartz", "Rose Quartz", "Light", False,
            bg="#fcf4f6", bg2="#f8e9ee", glow="#fbd6e1", sidebar="#f6e3ea", sidebar2="#fcf4f6",
            panel="rgba(255,255,255,0.8)", line="rgba(190,24,93,0.18)",
            accent="#be185d", accent_deep="#9d174d", accent2="#9d174d",
            txt="#2b1119", txt2="#6e4854", strong="#1f0a11",
            input="#ffffff", input2="#f6e3ea", popover="#ffffff",
-           btn_txt="#ffffff", ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           btn_txt="#ffffff", ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("lavender-sky", "Lavender Sky", "Light", False,
            bg="#f6f4fc", bg2="#ece8f8", glow="#e0d8fb", sidebar="#eae5f8", sidebar2="#f6f4fc",
            panel="rgba(255,255,255,0.8)", line="rgba(109,40,217,0.18)",
            accent="#6d28d9", accent_deep="#5b21b6", accent2="#5b21b6",
            txt="#1c1530", txt2="#574d72", strong="#120c22",
            input="#ffffff", input2="#eae5f8", popover="#ffffff",
-           btn_txt="#ffffff", ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           btn_txt="#ffffff", ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
 
     # ------------------------------------------------------------------ Rainbow
     _theme("holi", "Holi", "Rainbow", True,
@@ -206,11 +224,11 @@ THEMES = [
            sb_brand_color="#ff9d85",
            sb_btn_bg="linear-gradient(135deg, #ff7a5c 0%, #ff9d85 100%)", sb_btn_txt="#2a0c05",
            panel="rgba(255,255,255,0.85)", line="rgba(15,118,110,0.22)",
-           accent="#0f766e", accent_deep="#115e59", accent2="#b9381c", hi_rgb="255,111,89",
+           accent="#0f766e", accent_deep="#115e59", accent2="#9c2f17", hi_rgb="255,111,89",
            txt="#102a2b", txt2="#45605f", strong="#0a1f20",
            input="#ffffff", input2="#e3efee", popover="#ffffff",
            btn_txt="#ffffff", bar_bg="linear-gradient(90deg,#0f766e,#ff6f59)",
-           ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("navy-gold", "Navy × Gold", "Two-tone", True,
            bg="#0a1020", bg2="#0e1730", glow="#1b2c5c", sidebar="#0e1834", sidebar2="#0a1020",
            panel="rgba(255,255,255,0.04)", line="rgba(245,197,66,0.24)",
@@ -235,33 +253,36 @@ THEMES = [
            sb_brand_color="#fdba74",
            sb_btn_bg="linear-gradient(135deg, #f97316 0%, #fb923c 100%)", sb_btn_txt="#2a1003",
            panel="rgba(255,255,255,0.85)", line="rgba(126,34,206,0.18)",
-           accent="#7e22ce", accent_deep="#6b21a8", accent2="#b93d0b", hi_rgb="249,115,22",
+           accent="#7e22ce", accent_deep="#6b21a8", accent2="#9a3309", hi_rgb="249,115,22",
            txt="#1f1230", txt2="#5b4a70", strong="#150a22",
            input="#ffffff", input2="#efe7f8", popover="#ffffff",
            btn_txt="#ffffff", bar_bg="linear-gradient(90deg,#7e22ce,#f97316)",
-           ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
 
     # ------------------------------------------------------------------ Flowers
+    # sticker_tint is the glyph's most text-hostile pixel as Noto Color Emoji draws it:
+    # the darkest one on a light theme, the lightest on a dark one. The contrast test
+    # lays text over it at the tile's opacity, so it must never be a softened average.
     _theme("mallige", "Mallige (Jasmine)", "Flowers", False,
-           sticker="💮", sticker_tint="#f4a6c8",
+           sticker="💮", sticker_tint="#cf7b95",
            bg="#fbfcf7", bg2="#f4f7ec", glow="#ffffff", sidebar="#edf3e2", sidebar2="#fbfcf7",
            panel="rgba(255,255,255,0.85)", line="rgba(63,98,18,0.20)",
            accent="#3f6212", accent_deep="#365314", accent2="#3f6212",
            txt="#1c2413", txt2="#4f5d40", strong="#141a0d",
            input="#ffffff", input2="#edf3e2", popover="#ffffff",
            btn_txt="#ffffff", bar_bg="linear-gradient(90deg,#3f6212,#a3c46b)",
-           ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("marigold", "Marigold", "Flowers", False,
-           sticker="🏵️", sticker_tint="#f59e0b",
+           sticker="🏵️", sticker_tint="#962311",
            bg="#fff9ef", bg2="#fff1d8", glow="#ffdf9e", sidebar="#fdebc8", sidebar2="#fff9ef",
            panel="rgba(255,255,255,0.82)", line="rgba(194,94,0,0.24)",
            accent="#b45309", accent_deep="#9a4405", accent2="#9a3c00",
-           txt="#2d1a05", txt2="#6a4a26", strong="#1f1203",
+           txt="#2d1a05", txt2="#5e4120", strong="#1f1203",
            input="#ffffff", input2="#fdebc8", popover="#ffffff",
            btn_txt="#ffffff", bar_bg="linear-gradient(90deg,#c25e00,#ffb627)",
-           ok="#065f46", warn="#b91c1c", warn_rgb="220,38,38"),
+           ok="#065f46", warn="#991b1b", warn_rgb="220,38,38"),
     _theme("lotus", "Lotus", "Flowers", True,
-           sticker="🪷", sticker_tint="#f472b6",
+           sticker="🪷", sticker_tint="#feebc8",
            bg="#0b1210", bg2="#0f1916", glow="#3a1530", sidebar="#0f1a17", sidebar2="#0b1210",
            panel="rgba(255,255,255,0.04)", line="rgba(244,114,182,0.24)",
            accent="#f472b6", accent_deep="#ec4899", accent2="#f9b4d9",
@@ -270,7 +291,7 @@ THEMES = [
            btn_txt="#1f0614", bar_bg="linear-gradient(90deg,#ec4899,#86efac)",
            ok="#86efac", warn="#fca5a5", warn_rgb="248,113,113"),
     _theme("hibiscus", "Hibiscus", "Flowers", True,
-           sticker="🌺", sticker_tint="#e11d48",
+           sticker="🌺", sticker_tint="#fee165",
            bg="#14070a", bg2="#1c0a0e", glow="#3d0c18", sidebar="#200b10", sidebar2="#14070a",
            panel="rgba(255,255,255,0.04)", line="rgba(255,77,109,0.24)",
            accent="#ff4d6d", accent_deep="#e11d48", accent2="#ffb3c1",
@@ -494,7 +515,93 @@ header[data-testid="stHeader"] button, header[data-testid="stHeader"] svg,
     color:var(--txt) !important;
 }
 [data-testid="stCode"], .stMarkdown code { background:var(--input2) !important; color:var(--txt) !important; }
+
+/* Streamlit 1.66 specifics, checked against the live DOM (selectors and colours).
+   Bordered st.container(): there is no BorderWrapper any more; the bordered block is
+   the stVerticalBlock directly inside a stLayoutWrapper, and its border comes from
+   config. Only bordered blocks have a border-style, so recolouring every block's
+   border is harmless; the fill and shadow go on the wrapped blocks only (a plain
+   st.container() would get them too, which GharSe does not use). */
+[data-testid="stVerticalBlock"] { border-color:var(--line) !important; }
+[data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"] {
+    background:var(--panel); border-radius:14px; box-shadow:0 8px 26px var(--shadow);
+}
+/* Date field: a react-aria DateField with no <input>. The outer field keeps config's
+   secondary background and its digits are spans coloured with config's text colour. */
+[data-testid="stDateInputField"] {
+    background:var(--input) !important; border:1px solid var(--line) !important; border-radius:10px !important;
+}
+[data-testid="stDateInputField"]:focus-within { border-color:var(--accent) !important; }
+[data-testid="stDateInputField"] div[role="group"] { background:transparent !important; border:0 !important; }
+[data-testid="stDateInput"] [role="spinbutton"] { color:var(--txt) !important; }
+[data-testid="stDateInput"] [data-type="literal"],
+[data-testid="stDateInput"] [role="spinbutton"][data-placeholder] { color:var(--muted) !important; }
+[data-testid="stDateInputCalendarButton"], [data-testid="stDateInputClearButton"] {
+    color:var(--txt2) !important; background:transparent !important;
+}
+/* The calendar popover renders in a portal on config's background. */
+[data-testid="stDateInputCalendar"], [data-testid="stDateInputQuickSelectPopover"] {
+    background:var(--popover) !important; color:var(--txt) !important; border:1px solid var(--line) !important;
+}
+[data-testid="stDateInputCalendar"] header button { color:var(--txt) !important; }
+[data-testid="stDateInputCalendar"] header button svg { color:var(--txt2) !important; }
+[data-testid="stDateInputCalendar"] th { color:var(--muted) !important; }
+[data-testid="stDateInputCalendar"] [role="gridcell"] [role="button"] { color:var(--txt) !important; }
+[data-testid="stDateInputCalendar"] [role="gridcell"] [role="button"][data-hovered="true"],
+[data-testid="stDateInputCalendar"] [role="gridcell"] [role="button"][data-focus-visible="true"] {
+    background:rgba(var(--accent-rgb),.16) !important;
+}
+[data-testid="stDateInputCalendar"] [role="gridcell"] [role="button"][data-outside-month],
+[data-testid="stDateInputCalendar"] [role="gridcell"] [role="button"][data-disabled] {
+    color:var(--muted) !important; opacity:.6;
+}
+[data-testid="stDateInputCalendar"] [role="gridcell"] [role="button"][data-selected] {
+    background:var(--btn-solid) !important; color:var(--btn-txt) !important; font-weight:700;
+}
+/* Native icons and hints that carry config's text colours onto the theme's inputs */
+[data-testid="stSelectbox"] button, [data-testid="stMultiSelect"] button,
+[data-testid="stTextInputRootElement"] button { color:var(--txt2) !important; }
+[data-testid="stFileUploaderDropzoneInstructions"] span,
+[data-testid="stFileUploaderDropzoneInstructions"] small { color:var(--muted) !important; }
+/* Material icons inside themed buttons (the uploader's "Upload") sit on the button fill */
+.stButton button [data-testid="stIconMaterial"],
+[data-testid="stBaseButton-secondary"] [data-testid="stIconMaterial"],
+[data-testid="stBaseButton-primary"] [data-testid="stIconMaterial"] { color:var(--btn-txt) !important; }
+/* Multiselect chips ship as primary-colour fills with config's text on them */
+[data-testid="stMultiSelectTagsContainer"] [data-tag] {
+    background:var(--input2) !important; border:1px solid var(--line) !important;
+}
+[data-testid="stMultiSelectTagsContainer"] [data-tag] * { color:var(--txt) !important; }
+/* Radio in 1.66: label[stRadioOption] > div > div(ring) > div(dot). The base rule above
+   reaches one level too deep, so the ring keeps config's near-black fill and amber. */
+[data-testid="stRadioOption"] > div > div:first-child {
+    background:var(--input) !important; border-color:var(--txt2) !important;
+}
+[data-testid="stRadioOption"][data-selected="true"] > div > div:first-child {
+    background:var(--accent) !important; border-color:var(--accent) !important;
+}
+[data-testid="stRadioOption"] > div > div:first-child > div { background:var(--input) !important; }
+/* Checkbox: the unchecked box has no svg yet, so the rule above misses it */
+[data-testid="stCheckbox"] label:not([data-selected="true"]) > span + div {
+    background:var(--input) !important; border-color:var(--txt2) !important;
+}
+/* The text area's root carries config's secondary background as a border */
+[data-testid="stTextAreaRootElement"] { border-color:transparent !important; }
+/* st.caption fades itself with opacity .6, which takes --muted under 4.5:1 on light grounds */
+[data-testid="stCaptionContainer"] { opacity:1 !important; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color:var(--muted) !important; }
+/* A disabled button (the picker's "In use") must not look clickable */
+.stButton>button:disabled {
+    background:var(--input2) !important; box-shadow:none; filter:none; transform:none; cursor:default;
+}
+.stButton>button:disabled p { color:var(--txt2) !important; }
 """
+
+# Native scrollbars and form chrome follow color-scheme, which Streamlit sets from
+# config's base=dark; a light page or a light sidebar needs it flipped.
+_LIGHT_PAGE_CSS = ":root, .stApp { color-scheme:light; }\n"
+_LIGHT_SIDEBAR_CSS = 'section[data-testid="stSidebar"] { color-scheme:light; }\n'
+_DARK_SIDEBAR_CSS = 'section[data-testid="stSidebar"] { color-scheme:dark; }\n'
 
 # Sticker themes: a faint tile of the flower behind everything. The layer is a fixed
 # pseudo-element at z-index -1 inside .stApp's own stacking context, so it paints above
@@ -506,6 +613,10 @@ _STICKER_CSS = """
     background-image:var(--sticker-tile); background-size:168px 168px; background-repeat:repeat;
 }
 .brand::after { content:var(--sticker-mark); margin-left:.35rem; font-size:.9em; pointer-events:none; }
+/* Pills are small text; give them a solid ground so a petal never sits behind one. */
+.pill { background:linear-gradient(rgba(var(--hi-rgb),.12), rgba(var(--hi-rgb),.12)) var(--bg); }
+.pill.ok { background:linear-gradient(rgba(var(--ok-rgb),.12), rgba(var(--ok-rgb),.12)) var(--bg); }
+.pill.warn { background:linear-gradient(rgba(var(--warn-rgb),.12), rgba(var(--warn-rgb),.12)) var(--bg); }
 """
 
 # Swatch cards for theme_picker(). Structure only; every colour is set per swatch.
@@ -523,7 +634,8 @@ _PICKER_CSS = """
 .th-name { font-weight:700; font-size:.92rem; }
 """
 
-SWATCH_OPACITY = 0.13  # how strongly a sticker tile shows; kept faint so text never suffers
+SWATCH_OPACITY = 0.13       # page tile opacity; run_themes.py checks text over the darkest/lightest petal
+PICKER_SWATCH_OPACITY = 0.22  # the picker's small preview tile (brand and tagline sit on it)
 
 
 def sticker_tile(emoji, size=168, opacity=SWATCH_OPACITY):
@@ -539,6 +651,10 @@ def sticker_tile(emoji, size=168, opacity=SWATCH_OPACITY):
     return "data:image/svg+xml;charset=utf-8," + quote(svg, safe="")
 
 
+def _is_light(hex_colour):
+    return _lum(hex_colour) > 0.18   # brighter than mid-grey: dark text reads better on it
+
+
 def _root_vars(theme):
     t = theme["tokens"]
     names = {
@@ -551,7 +667,7 @@ def _root_vars(theme):
         "accent_rgb": "accent-rgb", "hi_rgb": "hi-rgb",
         "txt": "txt", "txt2": "txt2", "muted": "muted", "strong": "strong",
         "input": "input", "input2": "input2", "popover": "popover",
-        "btn_bg": "btn-bg", "btn_txt": "btn-txt", "bar_bg": "bar-bg",
+        "btn_bg": "btn-bg", "btn_txt": "btn-txt", "btn_solid": "btn-solid", "bar_bg": "bar-bg",
         "brand_fill": "brand-fill", "brand_color": "brand-color",
         "ok": "ok", "ok_rgb": "ok-rgb", "warn": "warn", "warn_rgb": "warn-rgb",
         "shadow": "shadow", "shadow2": "shadow2",
@@ -571,6 +687,9 @@ def css_for(key):
     parts = [_root_vars(theme), _BASE_CSS, _SIDEBAR_SCOPE]
     if theme["key"] != DEFAULT_THEME:
         parts.append(_NATIVE_CSS)
+        if not theme["dark"]:
+            parts.append(_LIGHT_PAGE_CSS)
+        parts.append(_LIGHT_SIDEBAR_CSS if _is_light(theme["tokens"]["sidebar"]) else _DARK_SIDEBAR_CSS)
     if theme.get("sticker"):
         parts.append(_STICKER_CSS)
     parts.append(_PICKER_CSS)
@@ -583,7 +702,7 @@ def _swatch_html(theme, current):
     tile = ""
     if theme.get("sticker"):
         # Percent-encoded with no quotes or parentheses left, so it sits unquoted in url().
-        tile = f"background-image:url({sticker_tile(theme['sticker'], size=84, opacity=0.22)});"
+        tile = f"background-image:url({sticker_tile(theme['sticker'], size=84, opacity=PICKER_SWATCH_OPACITY)});"
     brand_style = f"color:{t['brand_color']};"
     if t["brand_fill"] != "none":
         brand_style += (f"background:{t['brand_fill']};-webkit-background-clip:text;"

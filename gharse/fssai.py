@@ -477,8 +477,11 @@ def _help_button(user):
     if not p:
         return
     tag = f"(helper #{p['id']})"
-    pending = q("SELECT 1 FROM notifications WHERE kind=? AND status='Queued' AND body LIKE ?",
-                ("FSSAI help", f"%{tag}%"))
+    # Keyed on the provider id, not on text in the body: the body carries names other
+    # helpers choose, so a substring match let one helper hide another's button.
+    # notifications.order_id is the table's generic reference column.
+    pending = q("SELECT 1 FROM notifications WHERE kind=? AND status='Queued' AND order_id=?",
+                ("FSSAI help", p["id"]))
     if pending:
         st.markdown("<span class='pill ok'>Asked ✓</span> <span class='muted'>The GharSe team has your "
                     "request and will call you to fix a time.</span>", unsafe_allow_html=True)
@@ -488,7 +491,7 @@ def _help_button(user):
                 f"{tag}, {p.get('display_name') or ''}, {p.get('area') or 'area not set'}, "
                 f"phone {p.get('phone') or 'not on file'}. Please call and sit with her to fill the "
                 f"FoSCoS application.")
-        notify("", "GharSe team", "admin", "FSSAI help", body)
+        notify("", "GharSe team", "admin", "FSSAI help", body, order_id=p["id"])
         st.session_state["fg_flash"] = ("Done. The GharSe team will call you on the number in your "
                                         "profile to fix a time.")
         st.rerun()
@@ -565,6 +568,10 @@ def provider_fssai_section(user):
         c = st.columns(2)
         number = c[0].text_input("FSSAI number (14 digits, from the certificate)",
                                  p.get("fssai_no") or "", key="fssai_no", max_chars=20)
+        # A stored date outside the picker's range used to crash this whole page, with no way
+        # for her to fix it. Clamp what we show; validation below still judges what she saves.
+        if exp_now is not None:
+            exp_now = min(max(exp_now, date(2000, 1, 1)), date(2100, 12, 31))
         expiry = c[1].date_input("Valid until (expiry date on the certificate)", value=exp_now,
                                  min_value=date(2000, 1, 1), max_value=date(2100, 12, 31),
                                  format="DD/MM/YYYY", key="fssai_expiry",

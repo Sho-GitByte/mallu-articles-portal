@@ -13,8 +13,9 @@
 # Contact details stay private. A phone number is shown only to the other party, and
 # only once the application or learn request has been accepted.
 
+import re
 from datetime import date, timedelta
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
 import streamlit as st
 
@@ -35,6 +36,11 @@ REQUESTED = "Requested"
 
 YOUTUBE_SEARCH = "https://www.youtube.com/results?search_query="
 _YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+# A video ID is always 11 characters of this alphabet; playlist IDs vary in length.
+_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+_LIST_ID = re.compile(r"[A-Za-z0-9_-]{10,64}")
+_SHORT_PATH = re.compile(r"/([A-Za-z0-9_-]{11})/?")                       # youtu.be/ID
+_VIDEO_PATH = re.compile(r"/(?:shorts|live|embed)/([A-Za-z0-9_-]{11})/?")  # youtube.com/shorts/ID …
 
 _SAFETY_LINE = ("For a first meeting, meet at your own home with someone else around, or somewhere public. "
                 "Never pay a full course fee in advance — pay class by class until you trust each other.")
@@ -61,9 +67,17 @@ for _a, _bs in _NEXT_TO.items():
         _NEAR.setdefault(_b, set()).add(_a)
 
 
+def has_home(area):
+    """True when an area is a real neighbourhood we can rank by. "Other" can mean
+    anywhere in the city, so two people in "Other" are not neighbours."""
+    return bool(area) and area in AREAS and area != "Other"
+
+
 def nearness(my_area, area):
-    """0 = your area, 1 = next door, 2 = elsewhere in the city."""
-    if area and area == my_area:
+    """0 = your area, 1 = next door, 2 = elsewhere in the city (or we can't tell)."""
+    if not has_home(my_area) or not has_home(area):
+        return 2
+    if area == my_area:
         return 0
     if area in _NEAR.get(my_area, ()):
         return 1
@@ -76,42 +90,72 @@ def youtube_search_url(query):
     return YOUTUBE_SEARCH + quote_plus(query or "")
 
 
+def _watch(video_id):
+    return "https://www.youtube.com/watch?v=" + video_id
+
+
 def check_youtube_url(url):
-    """(ok, cleaned url or reason). Only https links to a video or playlist on
-    youtube.com or youtu.be get through — this link is shown to every learner."""
+    """(ok, canonical url or reason). Only https links to a single video or playlist on
+    youtube.com or youtu.be get through — this link is shown to every learner as
+    vouched for by GharSe. The link is rebuilt from the video or playlist ID alone, so
+    nothing else the person pasted (extra paths, '..' segments, tracking parameters)
+    ever reaches a learner, and the same video pasted twice is recognised."""
     u = (url or "").strip()
     if not u:
         return False, "Paste the video's link."
-    if len(u) > 500 or any(ch.isspace() for ch in u):
+    if len(u) > 500 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in u):
         return False, "That doesn't look like a single link. Copy it again from the YouTube share button."
+    if not u.isascii():
+        return False, ("That link has look-alike letters in it, so it may not be YouTube. "
+                       "Copy it straight from YouTube's share button.")
+    hiding = "That link hides where it really goes. Copy it straight from YouTube's share button."
+    if "\\" in u:
+        return False, hiding
     try:
-        p = urlparse(u)
+        p = urlsplit(u)
         port = p.port
     except ValueError:
         return False, "That link isn't valid. Copy it again from the YouTube share button."
-    if (p.scheme or "").lower() != "https":
+    if p.scheme.lower() != "https":
         return False, "Only https:// YouTube links can be added (youtube.com or youtu.be)."
+    netloc = p.netloc.lower()
     host = (p.hostname or "").lower()
-    if p.username or p.password or port not in (None, 443):
-        return False, "That link hides where it really goes. Copy it straight from YouTube's share button."
-    if host not in _YT_HOSTS:
-        return False, (f"That link goes to {host or 'an unknown site'}, not YouTube. "
-                       "Only youtube.com or youtu.be links can be added.")
+    if "@" in netloc or p.username is not None or p.password is not None or port not in (None, 443):
+        return False, hiding
+    if host not in _YT_HOSTS or netloc not in (host, host + ":443"):
+        return False, "That link doesn't go to YouTube. Only youtube.com or youtu.be links can be added."
     path = p.path or ""
+    low = path.lower()
+    if any(seg in (".", "..") for seg in path.split("/")) or any(e in low for e in ("%2e", "%2f", "%5c")):
+        return False, hiding
+    not_video = "That's a YouTube page, but not a video or playlist. Open the video itself and copy its link."
     if host == "youtu.be":
-        if len(path.strip("/")) < 5:
+        m = _SHORT_PATH.fullmatch(path)
+        if not m:
             return False, "That youtu.be link has no video in it. Open the video and copy its link."
-        return True, u
+        return True, _watch(m.group(1))
     query = parse_qs(p.query)
-    if path == "/watch" and query.get("v", [""])[0]:
-        return True, u
-    if path == "/playlist" and query.get("list", [""])[0]:
-        return True, u
-    for prefix in ("/shorts/", "/live/", "/embed/"):
-        if path.startswith(prefix) and len(path) > len(prefix) + 4:
-            return True, u
-    return False, ("That's a YouTube page, but not a video or playlist. "
-                   "Open the video itself and copy its link.")
+    if path in ("/watch", "/watch/"):
+        v = query.get("v", [])
+        if len(v) == 1 and _VIDEO_ID.fullmatch(v[0]):
+            return True, _watch(v[0])
+        return False, not_video
+    if path in ("/playlist", "/playlist/"):
+        lst = query.get("list", [])
+        if len(lst) == 1 and _LIST_ID.fullmatch(lst[0]):
+            return True, "https://www.youtube.com/playlist?list=" + lst[0]
+        return False, not_video
+    m = _VIDEO_PATH.fullmatch(path)
+    if m:
+        return True, _watch(m.group(1))
+    return False, not_video
+
+
+def safe_video_url(url):
+    """The canonical link for a stored video, or None if it no longer passes the check
+    (a row saved before the check was tightened). Never link to a URL that fails."""
+    ok, result = check_youtube_url(url)
+    return result if ok else None
 
 
 # ----------------------------------------------------------------------------- people
@@ -153,9 +197,15 @@ def _person(user_id):
     return _who(dict(rows[0]), "x")
 
 
+_FALLBACK_NAMES = ("A neighbour", "GharSe team")
+
+
 def _first(name):
+    """First name for a friendly line. The fallbacks stay whole ("posted by A" is no name)."""
     name = (name or "").strip()
-    return name.split()[0] if name else "A neighbour"
+    if not name:
+        return "A neighbour"
+    return name if name in _FALLBACK_NAMES else name.split()[0]
 
 
 def user_area(user):
@@ -165,7 +215,9 @@ def user_area(user):
     elif user.get("role") == "customer":
         rec = customer_of(user)
     area = (rec or {}).get("area")
-    return area if area in AREAS else AREAS[0]
+    # Unknown (no area on file, or an admin) stays unknown: guessing AREAS[0] told a
+    # stranger's jobs that they were "In HSR Layout".
+    return area if area in AREAS else None
 
 
 def _tell(user_id, kind, body):
@@ -177,18 +229,27 @@ def _tell(user_id, kind, body):
 
 
 # ----------------------------------------------------------------------------- formatting
-def _pay(job):
+def _pay(job, esc=True):
+    """Pay as markup (esc=True, escaped) or as plain text for table(), which escapes itself."""
     pay = job.get("pay") or 0
     if pay > 0:
-        return f"{inr(pay)} {h(job.get('pay_unit') or '')}".strip()
+        unit = job.get("pay_unit") or ""
+        return f"{inr(pay)} {h(unit) if esc else unit}".strip()
     return "Volunteer" if job.get("kind") == "Volunteer" else "Pay to discuss"
 
 
-def _fee(offer):
+def _fee(offer, esc=True):
     fee = offer.get("fee") or 0
     if fee > 0:
-        return f"{inr(fee)} {h(offer.get('fee_unit') or '')}".strip()
+        unit = offer.get("fee_unit") or ""
+        return f"{inr(fee)} {h(unit) if esc else unit}".strip()
     return "Free"
+
+
+def _cell(v):
+    """A DB value for ui.table(), which HTML-escapes but expects one line: collapse
+    whitespace so a stored blank line can't end the table's HTML block early."""
+    return " ".join(v.split()) if isinstance(v, str) else v
 
 
 def _date(v):
@@ -222,6 +283,14 @@ def _near_label(n, area):
     return {0: f"In {h(area)}", 1: "Nearby"}.get(n, "Elsewhere in Bengaluru")
 
 
+def _no_home_note(area):
+    """Shown instead of "in <area>" when we can't tell what's near this person."""
+    if area == "Other":
+        return ("Your area is set to “Other”, so we can't tell what's nearest to you. If your "
+                "neighbourhood is in the list, pick it in your profile.")
+    return "Set your area in your profile to see what's nearest to you first."
+
+
 def _flash(key):
     msg = st.session_state.pop(key, None)
     if msg:
@@ -231,7 +300,7 @@ def _flash(key):
 def _contact_line(other_name, phone, my_phone, wa_text, key):
     st.markdown(f"Reach <b>{h(other_name)}</b> on <b>{h(phone or 'no number on file yet')}</b>.",
                 unsafe_allow_html=True)
-    st.caption(f"Your number {my_phone} has been shared with them." if my_phone else
+    st.caption(f"Your number {h(my_phone)} has been shared with them." if my_phone else
                "Add your phone number in your profile so they can reach you too.")
     link = wa_link(phone, wa_text) if phone else None
     if link:
@@ -270,7 +339,8 @@ def learn_and_earn(user):
 def _jobs_near(user, me, area):
     c = st.columns([2, 1])
     kind = c[0].selectbox("Kind of work", ["All kinds"] + JOB_KINDS, key="lj_kind")
-    only_mine = c[1].checkbox(f"Only {area}", key="lj_only")
+    home = has_home(area)
+    only_mine = c[1].checkbox(f"Only {area}", key="lj_only") if home else False
 
     sel, joins = _who_sql("j.poster_user_id", "po")
     rows = q(f"SELECT j.*{sel}, "
@@ -284,10 +354,15 @@ def _jobs_near(user, me, area):
         jobs = [j for j in jobs if j.get("area") == area]
     jobs.sort(key=lambda j: nearness(area, j.get("area")))   # stable: newest first within each band
 
-    here = sum(1 for j in jobs if j.get("area") == area)
-    st.markdown(f"<span class='muted'>{_plural(here, 'open job')} in {h(area)}"
-                f"{' · ' + str(len(jobs) - here) + ' more nearby and across the city' if len(jobs) > here else ''}"
-                "</span>", unsafe_allow_html=True)
+    if home:
+        here = sum(1 for j in jobs if j.get("area") == area)
+        st.markdown(f"<span class='muted'>{_plural(here, 'open job')} in {h(area)}"
+                    f"{' · ' + str(len(jobs) - here) + ' more nearby and across the city' if len(jobs) > here else ''}"
+                    "</span>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"<span class='muted'>{_plural(len(jobs), 'open job')} across Bengaluru</span>",
+                    unsafe_allow_html=True)
+        st.caption(_no_home_note(area))
     if not jobs:
         st.info("No open jobs here yet. When a neighbour posts one, it shows up here first for your area. "
                 "Need help yourself? Post a job in the next tab.")
@@ -298,7 +373,7 @@ def _jobs_near(user, me, area):
     band = None
     for j in jobs:
         n = nearness(area, j.get("area"))
-        if n != band:
+        if home and n != band:
             band = n
             st.markdown(f"<span class='muted'><b>{_near_label(n, area)}</b></span>", unsafe_allow_html=True)
         poster = _who(j, "po")
@@ -343,15 +418,20 @@ def _apply(user, me, job, note):
     if not fresh or fresh[0]["status"] != JOB_OPEN:
         st.error("This job has just closed.")
         return
-    if q("SELECT 1 FROM job_applications WHERE job_id=? AND applicant_user_id=?", (job["id"], user["id"])):
+    # One statement, so two quick submits can't both pass a separate check. (A unique
+    # index on (job_id, applicant_user_id) would make this airtight on Postgres too.)
+    new_id = execute(
+        "INSERT INTO job_applications (job_id, applicant_user_id, note, status, created_at) "
+        "SELECT ?,?,?,?,? WHERE NOT EXISTS "
+        "(SELECT 1 FROM job_applications WHERE job_id=? AND applicant_user_id=?) RETURNING id",
+        (job["id"], user["id"], note.strip(), APPLIED, now_iso(), job["id"], user["id"]))
+    if new_id is None:
         st.error("You've already applied for this job.")
         return
-    execute("INSERT INTO job_applications (job_id, applicant_user_id, note, status, created_at) "
-            "VALUES (?,?,?,?,?)", (job["id"], user["id"], note.strip(), APPLIED, now_iso()))
     _tell(job["poster_user_id"], "job_applied",
           f"{me['name']} has applied for your job \"{job.get('title')}\" on GharSe: \"{note.strip()}\". "
           "Open Learn & Earn to accept or decline.")
-    st.session_state["learn_flash"] = (f"Applied for “{job.get('title')}”. If they accept, you'll both see "
+    st.session_state["learn_flash"] = (f"Applied for “{h(job.get('title'))}”. If they accept, you'll both see "
                                        "each other's phone number.")
     st.rerun()
 
@@ -377,7 +457,8 @@ def _post_job(user, me, area):
             unit = c[1].selectbox("Pay is", PAY_UNITS, key=k("unit"))
             hours = c[2].text_input("Hours", key=k("hours"), placeholder="e.g. 7–10 AM, Mon–Sat")
             c = st.columns(2)
-            where = c[0].selectbox("Area", AREAS, index=idx(AREAS, area), key=k("area"))
+            where = c[0].selectbox("Area", AREAS, index=idx(AREAS, area) if area else None,
+                                   placeholder="Choose the area", key=k("area"))
             starts = c[1].date_input("Starts", today_ist() + timedelta(days=1), min_value=today_ist(),
                                      key=k("starts"))
             if st.form_submit_button("Post job", type="primary"):
@@ -386,6 +467,8 @@ def _post_job(user, me, area):
                     errors.append("Give the job a title.")
                 if pay <= 0 and kind != "Volunteer":
                     errors.append("Enter the pay. If it's unpaid, choose “Volunteer” as the kind.")
+                if not where:
+                    errors.append("Choose the area where the work is.")
                 if errors:
                     for e in errors:
                         st.error(e)
@@ -395,7 +478,7 @@ def _post_job(user, me, area):
                         (user["id"], title.strip(), kind, category, desc.strip(), pay if pay > 0 else None,
                          unit, hours.strip(), where, starts.isoformat(), JOB_OPEN, now_iso()))
                 st.session_state["lj_post_n"] = n + 1
-                st.session_state["learn_flash"] = (f"Posted “{title.strip()}”. Neighbours in {where} see it "
+                st.session_state["learn_flash"] = (f"Posted “{h(title.strip())}”. Neighbours in {h(where)} see it "
                                                    "first — applications will appear under Your job posts.")
                 st.rerun()
 
@@ -440,7 +523,9 @@ def _my_jobs(user, me):
                         _decide_application(user, me, j, a, DECLINED)
                 else:
                     ac[1].markdown(_pill(a["status"]), unsafe_allow_html=True)
-                if a["status"] == ACCEPTED:
+                if a["status"] == ACCEPTED and j.get("status") == JOB_REMOVED:
+                    st.caption("GharSe closed this post, so contact details are no longer shown here.")
+                elif a["status"] == ACCEPTED:
                     _contact_line(who["name"], who["phone"], me["phone"],
                                   f"Hi {_first(who['name'])}, this is {me['name']} from GharSe, about the job "
                                   f"\"{j.get('title')}\".", f"ljwa_ap{a['id']}")
@@ -453,30 +538,35 @@ def _my_jobs(user, me):
 
 
 def _decide_application(user, me, job, app, status):
-    fresh = q("SELECT status FROM job_applications WHERE id=?", (app["id"],))
-    jfresh = q("SELECT status FROM jobs WHERE id=?", (job["id"],))
-    if not fresh or fresh[0]["status"] != APPLIED or not jfresh or jfresh[0]["status"] != JOB_OPEN:
+    # Check and change in one statement: only a still-waiting application on a job of
+    # yours that is still open can be answered, however stale the page was.
+    done = execute("UPDATE job_applications SET status=? WHERE id=? AND status=? AND EXISTS "
+                   "(SELECT 1 FROM jobs WHERE jobs.id=? AND jobs.status=? AND jobs.poster_user_id=?) "
+                   "RETURNING id", (status, app["id"], APPLIED, job["id"], JOB_OPEN, user["id"]))
+    if done is None:
         st.session_state["learn_flash"] = "That application has already been answered."
         st.rerun()
-    execute("UPDATE job_applications SET status=? WHERE id=?", (status, app["id"]))
     who = _who(app, "ap")
     if status == ACCEPTED:
         _tell(app["applicant_user_id"], "job_accepted",
               f"Good news — {me['name']} accepted your application for \"{job.get('title')}\" in {job.get('area')}, "
               f"starting {_date(job.get('starts'))}."
               + (f" Their number: {me['phone']}." if me["phone"] else " Open GharSe for the details."))
-        st.session_state["learn_flash"] = (f"You accepted {who['name']}. Their number is below, and yours has "
+        st.session_state["learn_flash"] = (f"You accepted {h(who['name'])}. Their number is below, and yours has "
                                            "been shared with them.")
     else:
         _tell(app["applicant_user_id"], "job_declined",
               f"\"{job.get('title')}\" went to someone else this time. Thank you for applying — "
               "there are more jobs near you on GharSe.")
-        st.session_state["learn_flash"] = f"Declined {who['name']}'s application. They've been told kindly."
+        st.session_state["learn_flash"] = f"Declined {h(who['name'])}'s application. They've been told kindly."
     st.rerun()
 
 
 def _end_job(job, status):
-    execute("UPDATE jobs SET status=? WHERE id=? AND status=?", (status, job["id"], JOB_OPEN))
+    if execute("UPDATE jobs SET status=? WHERE id=? AND status=? RETURNING id",
+               (status, job["id"], JOB_OPEN)) is None:
+        st.session_state["learn_flash"] = "That job was already closed."
+        st.rerun()
     pending = q("SELECT id, applicant_user_id FROM job_applications WHERE job_id=? AND status=?",
                 (job["id"], APPLIED))
     execute("UPDATE job_applications SET status=? WHERE job_id=? AND status=?", (DECLINED, job["id"], APPLIED))
@@ -500,9 +590,15 @@ def _learn(user, me, area):
     by_skill = {}
     for o in offers:
         by_skill.setdefault(o.get("skill"), []).append(o)
-    here_teachers = {o["teacher_user_id"] for o in offers if o.get("area") == area}
-    here_skills = {o.get("skill") for o in offers if o.get("area") == area}
-    if here_teachers:
+    home = has_home(area)
+    here_teachers = {o["teacher_user_id"] for o in offers if home and o.get("area") == area}
+    here_skills = {o.get("skill") for o in offers if home and o.get("area") == area}
+    if not home:
+        st.markdown(f"<span class='muted'>{_plural(len({o['teacher_user_id'] for o in offers}), 'neighbour')} "
+                    "on GharSe teach — the videos below are free, and if you know a skill yourself, offer it "
+                    "under Teach a skill.</span>", unsafe_allow_html=True)
+        st.caption(_no_home_note(area))
+    elif here_teachers:
         st.markdown(f"<b>{_plural(len(here_teachers), 'neighbour')} in {h(area)} "
                     f"{'teaches' if len(here_teachers) == 1 else 'teach'} {_plural(len(here_skills), 'skill')}.</b> "
                     "<span class='muted'>Watch the videos to start, and ask a teacher nearby when you want "
@@ -514,36 +610,48 @@ def _learn(user, me, area):
 
     c = st.columns([2, 1])
     pick = c[0].selectbox("Skill", ["All skills"] + list(SKILLS), key="ll_skill")
-    near_only = c[1].checkbox(f"Only skills taught in {area}", key="ll_near")
+    near_only = c[1].checkbox(f"Only skills taught in {area}", key="ll_near") if home else False
     skills = list(SKILLS) if pick == "All skills" else [pick]
     if near_only:
         skills = [s for s in skills if s in here_skills]
         if not skills:
             st.caption(f"No one in {area} teaches {'that' if pick != 'All skills' else 'anything'} yet.")
+    # Area-first at the skill level too: a skill with a teacher in your own area comes
+    # before seventeen skills that have nobody near you. Catalog order breaks ties.
+    order = {s: i for i, s in enumerate(SKILLS)}
+    skills.sort(key=lambda s: (min((nearness(area, o.get("area")) for o in by_skill.get(s, [])), default=3),
+                               order.get(s, len(order))))
 
     for skill in skills:
         teachers = sorted(by_skill.get(skill, []), key=lambda o: (nearness(area, o.get("area")), o["id"]))
-        vids = [v for v in links if v.get("skill") == skill]
-        n_here = sum(1 for o in teachers if o.get("area") == area)
+        vids = [(v, safe_video_url(v.get("url"))) for v in links if v.get("skill") == skill]
+        vids = [(v, u) for v, u in vids if u]   # a stored link that fails today's check is never shown
+        n_here = sum(1 for o in teachers if nearness(area, o.get("area")) == 0)
         n_near = sum(1 for o in teachers if nearness(area, o.get("area")) == 1)
         with st.container(border=True):
             c = st.columns([3, 1])
-            count = (f"<span class='pill ok'>{_plural(n_here, 'teacher')} in {h(area)}</span>" if n_here else
-                     f"<span class='pill'>No teacher in {h(area)} yet</span>")
-            more = len(teachers) - n_here
-            extra = (f" <span class='muted'>· {n_near} nearby" + (f", {more - n_near} elsewhere" if more > n_near else "")
-                     + "</span>") if more else ""
+            if home:
+                count = (f"<span class='pill ok'>{_plural(n_here, 'teacher')} in {h(area)}</span>" if n_here else
+                         f"<span class='pill'>No teacher in {h(area)} yet</span>")
+                more = len(teachers) - n_here
+                extra = (f" <span class='muted'>· {n_near} nearby"
+                         + (f", {more - n_near} elsewhere" if more > n_near else "") + "</span>") if more else ""
+            else:
+                count = (f"<span class='pill'>{_plural(len(teachers), 'teacher')} on GharSe</span>" if teachers
+                         else "<span class='pill'>No teacher yet</span>")
+                extra = ""
             c[0].markdown(f"<b>{h(skill)}</b><br>{count}{extra}", unsafe_allow_html=True)
             c[1].link_button("Watch tutorials", youtube_search_url(SKILLS[skill]), key=f"llyt{idx(list(SKILLS), skill)}",
                              width="stretch")
             if vids:
                 items = "".join(
-                    f"<li><a href='{h(v['url'])}' target='_blank' rel='noopener noreferrer'>{h(v.get('title'))}</a>"
-                    f" <span class='muted'>· {h(v.get('language') or '')}</span></li>" for v in vids)
+                    f"<li><a href='{h(u)}' target='_blank' rel='noopener noreferrer'>{h(v.get('title'))}</a>"
+                    f" <span class='muted'>· {h(v.get('language') or '')}</span></li>" for v, u in vids)
                 st.markdown(f"<span class='muted'>Watched and recommended by the GharSe team</span><ul>{items}</ul>",
                             unsafe_allow_html=True)
             if teachers:
-                st.markdown("<span class='muted'><b>Teachers near you</b></span>", unsafe_allow_html=True)
+                st.markdown(f"<span class='muted'><b>{'Teachers near you' if home else 'Teachers'}</b></span>",
+                            unsafe_allow_html=True)
             for o in teachers:
                 _teacher_card(user, me, area, o, asked.get(o["id"]))
 
@@ -554,8 +662,9 @@ def _teacher_card(user, me, area, o, status):
     badge = " <span class='pill ok'>Verified</span>" if t["verified"] else ""
     langs = csv_join(csv_split(o.get("languages"))) or "—"
     about = f"<br>{h(o['about'])}" if (o.get("about") or "").strip() else ""
+    near = f" <span class='pill'>{_near_label(n, o.get('area') or '')}</span>" if has_home(area) else ""
     st.markdown(
-        f"<b>{h(t['name'])}</b>{badge} <span class='pill'>{_near_label(n, o.get('area') or '')}</span><br>"
+        f"<b>{h(t['name'])}</b>{badge}{near}<br>"
         f"<span class='muted'>{h(o.get('area') or '—')} · {h(o.get('level') or '')} level · {h(o.get('mode') or '')} · "
         f"speaks {h(langs)}</span> · <b>{_fee(o)}</b>{about}",
         unsafe_allow_html=True)
@@ -569,7 +678,7 @@ def _teacher_card(user, me, area, o, status):
                           f"Hi {_first(t['name'])}, I'm {me['name']} from GharSe — you agreed to teach me "
                           f"{o.get('skill')}.", f"llwa{o['id']}")
         return
-    with st.expander(f"Ask {_first(t['name'])} to teach you"):
+    with st.expander(f"Ask {h(_first(t['name']))} to teach you"):
         with st.form(f"ll_req{o['id']}"):
             note = st.text_input("A note to her", key=f"ll_note{o['id']}",
                                  placeholder="What you already know, what you'd like to learn, when you're free")
@@ -585,15 +694,21 @@ def _request_learn(user, me, offer, teacher, note):
     if not fresh or not fresh[0]["active"]:
         st.error("She has paused this offer for now.")
         return
-    if q("SELECT 1 FROM learn_requests WHERE offer_id=? AND learner_user_id=?", (offer["id"], user["id"])):
+    if offer["teacher_user_id"] == user["id"]:
+        st.error("This is your own offer.")
+        return
+    new_id = execute(
+        "INSERT INTO learn_requests (offer_id, learner_user_id, note, status, created_at) "
+        "SELECT ?,?,?,?,? WHERE NOT EXISTS "
+        "(SELECT 1 FROM learn_requests WHERE offer_id=? AND learner_user_id=?) RETURNING id",
+        (offer["id"], user["id"], note.strip(), REQUESTED, now_iso(), offer["id"], user["id"]))
+    if new_id is None:
         st.error("You've already asked her about this.")
         return
-    execute("INSERT INTO learn_requests (offer_id, learner_user_id, note, status, created_at) VALUES (?,?,?,?,?)",
-            (offer["id"], user["id"], note.strip(), REQUESTED, now_iso()))
     _tell(offer["teacher_user_id"], "learn_request",
           f"{me['name']} would like to learn {offer.get('skill')} from you: \"{note.strip()}\". "
           "Open Learn & Earn on GharSe to accept or decline.")
-    st.session_state["learn_flash"] = (f"Request sent to {teacher['name']}. If she says yes, you'll both see "
+    st.session_state["learn_flash"] = (f"Request sent to {h(teacher['name'])}. If she says yes, you'll both see "
                                        "each other's phone number.")
     st.rerun()
 
@@ -617,7 +732,8 @@ def _teach(user, me, area):
             fee = c[1].number_input("Fee (₹, 0 = free)", 0.0, 100000.0, 0.0, step=50.0, key=k("fee"))
             unit = c[2].selectbox("Fee is", FEE_UNITS, key=k("unit"))
             c = st.columns(2)
-            where = c[0].selectbox("Area", AREAS, index=idx(AREAS, area), key=k("area"))
+            where = c[0].selectbox("Area", AREAS, index=idx(AREAS, area) if area else None,
+                                   placeholder="Choose the area", key=k("area"))
             langs = c[1].multiselect("Languages you teach in", LANGUAGES, default=default_langs, key=k("langs"))
             about = st.text_area("About you and your classes", key=k("about"), height=80,
                                  placeholder="How long you've done this, what a learner can make after a month.")
@@ -625,17 +741,20 @@ def _teach(user, me, area):
                 if not langs:
                     st.error("Choose at least one language you teach in.")
                     return
+                if not where:
+                    st.error("Choose the area you teach in.")
+                    return
                 existing = q("SELECT id FROM skill_offers WHERE teacher_user_id=? AND skill=?", (user["id"], skill))
                 vals = (level, mode, fee, unit, where, csv_join(langs), about.strip())
                 if existing:
                     execute("UPDATE skill_offers SET level=?, mode=?, fee=?, fee_unit=?, area=?, languages=?, "
                             "about=?, active=1 WHERE id=?", vals + (existing[0]["id"],))
-                    msg = f"Updated your {skill} offer. It's live for learners in {where}."
+                    msg = f"Updated your {h(skill)} offer. It's live for learners in {h(where)}."
                 else:
                     execute("INSERT INTO skill_offers (teacher_user_id, skill, level, mode, fee, fee_unit, area, "
                             "languages, about, active, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             (user["id"], skill) + vals + (1, now_iso()))
-                    msg = (f"You're now teaching {skill}. Learners in {where} see you first — their requests "
+                    msg = (f"You're now teaching {h(skill)}. Learners in {h(where)} see you first — their requests "
                            "will appear below.")
                 st.session_state["lt_offer_n"] = n + 1
                 st.session_state["learn_flash"] = msg
@@ -666,11 +785,11 @@ def _my_offers(user):
             if o.get("active"):
                 if c[1].button("Pause", key=f"ltp{o['id']}", width="stretch"):
                     execute("UPDATE skill_offers SET active=0 WHERE id=?", (o["id"],))
-                    st.session_state["learn_flash"] = f"Paused {o.get('skill')}. Learners won't see it until you resume."
+                    st.session_state["learn_flash"] = f"Paused {h(o.get('skill'))}. Learners won't see it until you resume."
                     st.rerun()
             elif c[1].button("Resume", key=f"ltr{o['id']}", width="stretch"):
                 execute("UPDATE skill_offers SET active=1 WHERE id=?", (o["id"],))
-                st.session_state["learn_flash"] = f"{o.get('skill')} is live again."
+                st.session_state["learn_flash"] = f"{h(o.get('skill'))} is live again."
                 st.rerun()
 
 
@@ -706,24 +825,23 @@ def _incoming(user, me):
 
 
 def _decide_learn(me, req, status):
-    fresh = q("SELECT status FROM learn_requests WHERE id=?", (req["id"],))
-    if not fresh or fresh[0]["status"] != REQUESTED:
+    if execute("UPDATE learn_requests SET status=? WHERE id=? AND status=? RETURNING id",
+               (status, req["id"], REQUESTED)) is None:
         st.session_state["learn_flash"] = "That request has already been answered."
         st.rerun()
-    execute("UPDATE learn_requests SET status=? WHERE id=?", (status, req["id"]))
     who = _who(req, "le")
     if status == ACCEPTED:
         _tell(req["learner_user_id"], "learn_accepted",
               f"{me['name']} has agreed to teach you {req.get('skill')}."
               + (f" Her number: {me['phone']}." if me["phone"] else " Open GharSe for the details.")
               + " For the first class, meet at home with someone around, or somewhere public.")
-        st.session_state["learn_flash"] = (f"You'll teach {who['name']}. Their number is below, and yours has "
+        st.session_state["learn_flash"] = (f"You'll teach {h(who['name'])}. Their number is below, and yours has "
                                            "been shared with them.")
     else:
         _tell(req["learner_user_id"], "learn_declined",
               f"{me['name']} can't take on a new learner for {req.get('skill')} right now. "
               "Other teachers near you are on GharSe's Learn & Earn page.")
-        st.session_state["learn_flash"] = f"Declined {who['name']}'s request. They've been told kindly."
+        st.session_state["learn_flash"] = f"Declined {h(who['name'])}'s request. They've been told kindly."
     st.rerun()
 
 
@@ -731,7 +849,7 @@ def _decide_learn(me, req, status):
 def _activity(user, me):
     uid = user["id"]
     st.markdown("#### Jobs you posted")
-    table([{"job": r["title"], "area": r["area"], "status": _JOB_LABEL.get(r["status"], r["status"]),
+    table([{"job": _cell(r["title"]), "area": r["area"], "status": _JOB_LABEL.get(r["status"], r["status"]),
             "applicants": r["applicants"], "accepted": r["accepted"], "posted_at": r["created_at"]}
            for r in q("SELECT j.*, "
                       "(SELECT COUNT(*) FROM job_applications a WHERE a.job_id=j.id) AS applicants, "
@@ -747,15 +865,20 @@ def _activity(user, me):
                "WHERE a.applicant_user_id=? ORDER BY a.id DESC", (uid,)):
         d = dict(r)
         poster = _who(d, "po")
-        rows.append({"job": d["title"], "area": d["area"], "your application": d["app_status"],
+        if d["app_status"] != ACCEPTED:
+            contact = ""
+        elif d["job_status"] == JOB_REMOVED:
+            contact = "Hidden: GharSe closed this post"   # a takedown also ends the contact
+        else:
+            contact = f"{poster['name']} · {poster['phone'] or 'no number'}"
+        rows.append({"job": _cell(d["title"]), "area": d["area"], "your application": d["app_status"],
                      "job is": _JOB_LABEL.get(d["job_status"], d["job_status"]),
-                     "contact": (f"{poster['name']} · {poster['phone'] or 'no number'}"
-                                 if d["app_status"] == ACCEPTED else ""),
+                     "contact": _cell(contact),
                      "applied_at": d["applied_at"]})
     table(rows, empty="You haven't applied for a job.")
 
     st.markdown("#### Skills you teach")
-    table([{"skill": r["skill"], "area": r["area"], "fee": _fee(dict(r)),
+    table([{"skill": r["skill"], "area": r["area"], "fee": _cell(_fee(dict(r), esc=False)),
             "status": "Live" if r["active"] else "Paused", "requests": r["requests"],
             "accepted": r["accepted"]}
            for r in q("SELECT o.*, "
@@ -771,9 +894,9 @@ def _activity(user, me):
                f"JOIN skill_offers o ON o.id=r.offer_id{joins} WHERE r.learner_user_id=? ORDER BY r.id DESC", (uid,)):
         d = dict(r)
         t = _who(d, "t")
-        rows.append({"skill": d["skill"], "teacher": t["name"], "area": d["area"],
+        rows.append({"skill": d["skill"], "teacher": _cell(t["name"]), "area": d["area"],
                      "status": "Waiting" if d["status"] == REQUESTED else d["status"],
-                     "contact": t["phone"] if d["status"] == ACCEPTED else "", "asked_at": d["asked_at"]})
+                     "contact": _cell(t["phone"]) if d["status"] == ACCEPTED else "", "asked_at": d["asked_at"]})
     table(rows, empty="You haven't asked anyone to teach you yet.")
 
 
@@ -814,7 +937,7 @@ def learn_admin():
                 if not title.strip():
                     st.error("Give the video a title learners will understand.")
                 elif not ok:
-                    st.error(result)
+                    st.error(h(result))
                 elif q("SELECT 1 FROM skill_links WHERE skill=? AND url=?", (skill, result)):
                     st.error("That video is already listed under this skill.")
                 else:
@@ -822,7 +945,7 @@ def learn_admin():
                             "VALUES (?,?,?,?,?,?,?)",
                             (skill, title.strip(), result, "YouTube", lang, me.get("id"), now_iso()))
                     st.session_state["la_link_n"] = n + 1
-                    st.session_state["learn_admin_flash"] = f"Added “{title.strip()}” under {skill}."
+                    st.session_state["learn_admin_flash"] = f"Added “{h(title.strip())}” under {h(skill)}."
                     st.rerun()
 
     st.markdown("#### Vouched videos")
@@ -831,13 +954,16 @@ def learn_admin():
         st.caption("None yet. Learners still get a YouTube search for every skill.")
     for v in links:
         c = st.columns([4, 1])
-        c[0].markdown(f"<b>{h(v.get('skill'))}</b> · <a href='{h(v.get('url'))}' target='_blank' "
-                      f"rel='noopener noreferrer'>{h(v.get('title'))}</a> "
+        u = safe_video_url(v.get("url"))
+        link = (f"<a href='{h(u)}' target='_blank' rel='noopener noreferrer'>{h(v.get('title'))}</a>" if u else
+                f"{h(v.get('title'))} <span class='pill warn'>Link fails the YouTube check — hidden from "
+                "learners. Remove it and add it again.</span>")
+        c[0].markdown(f"<b>{h(v.get('skill'))}</b> · {link} "
                       f"<span class='muted'>· {h(v.get('language') or '')} · added {h(short_dt(v.get('created_at')))}"
                       "</span>", unsafe_allow_html=True)
         if c[1].button("Remove", key=f"larm{v['id']}", width="stretch"):
             execute("DELETE FROM skill_links WHERE id=?", (v["id"],))
-            st.session_state["learn_admin_flash"] = f"Removed “{v.get('title')}”."
+            st.session_state["learn_admin_flash"] = f"Removed “{h(v.get('title'))}”."
             st.rerun()
 
     st.markdown("#### Open jobs")
@@ -868,7 +994,8 @@ def learn_admin():
 
     st.markdown("#### Teachers")
     sel, joins = _who_sql("o.teacher_user_id", "t")
-    table([{"skill": d["skill"], "teacher": _who(d, "t")["name"], "area": d["area"], "fee": _fee(d),
+    table([{"skill": d["skill"], "teacher": _cell(_who(d, "t")["name"]), "area": d["area"],
+            "fee": _cell(_fee(d, esc=False)),
             "status": "Live" if d["active"] else "Paused", "requests": d["requests"], "offered_at": d["created_at"]}
            for d in (dict(r) for r in q(
                f"SELECT o.*{sel}, (SELECT COUNT(*) FROM learn_requests r WHERE r.offer_id=o.id) AS requests "
@@ -877,7 +1004,10 @@ def learn_admin():
 
 
 def _admin_close(job, reason):
-    execute("UPDATE jobs SET status=? WHERE id=?", (JOB_REMOVED, job["id"]))
+    if execute("UPDATE jobs SET status=? WHERE id=? AND status=? RETURNING id",
+               (JOB_REMOVED, job["id"], JOB_OPEN)) is None:
+        st.session_state["learn_admin_flash"] = f"Job #{job['id']} was already closed — nothing changed."
+        st.rerun()
     pending = q("SELECT applicant_user_id FROM job_applications WHERE job_id=? AND status=?", (job["id"], APPLIED))
     execute("UPDATE job_applications SET status=? WHERE job_id=? AND status=?", (DECLINED, job["id"], APPLIED))
     _tell(job["poster_user_id"], "job_removed",

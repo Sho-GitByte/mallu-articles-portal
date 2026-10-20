@@ -15,6 +15,7 @@
 # Contact details stay private until a quote is accepted; then the two parties see
 # each other's phone number and nobody else does.
 
+import hashlib
 from datetime import date, timedelta
 
 import streamlit as st
@@ -408,7 +409,11 @@ def _my_asks(cust):
                         # verification was withdrawn, can be read but never chosen.
                         bc[2].markdown("<span class='muted'>Not verified yet, so she can't be chosen "
                                        "for care.</span>", unsafe_allow_html=True)
-                    elif bc[2].button("Accept", key=f"askacc{b['id']}", width="stretch"):
+                    # The key carries what she is looking at. If the helper edits or withdraws
+                    # and re-quotes after this rendered, the click arrives for a button that no
+                    # longer exists, so it does nothing — she can only accept the quote she saw.
+                    elif bc[2].button("Accept", width="stretch",
+                                      key=f"askacc{b['id']}_{_quote_fp(b)}"):
                         _accept(cust, req, b)
                         st.rerun()
                 else:
@@ -437,6 +442,12 @@ def _my_asks(cust):
                     st.session_state["ask_flash"] = ("warn", "That ask was no longer open, so it wasn't cancelled — "
                                                              "here is where it stands now.")
                 st.rerun()
+
+
+def _quote_fp(b):
+    """A short fingerprint of the quote as shown: price, note and when it was made."""
+    raw = f"{b.get('price')}|{b.get('note')}|{b.get('eta')}|{b.get('created_at')}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
 
 def _accept(cust, req, b):

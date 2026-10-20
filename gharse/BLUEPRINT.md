@@ -118,6 +118,11 @@ only closes when one trip carries several orders:
 So delivery design is not an ops detail, it is the business model. Dense cells, batched runs,
 pickup points. Never one meal, nine kilometres.
 
+**Decision since: no rider at all.** The helper lives a few minutes away, so the customer
+collects from her home, free — that is the default in the app now. It removes the per-trip loss
+above entirely rather than managing it, and keeps a home meal cheaper than a restaurant one.
+Pickup points and "she brings it to you" stay available as options, free unless admin sets a fee.
+
 ---
 
 ## 6. Revenue streams

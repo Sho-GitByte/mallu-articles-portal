@@ -495,6 +495,15 @@ def admin_providers(user=None):
             if d.button("Save", key=f"savep{p['id']}", use_container_width=True):
                 execute("UPDATE providers SET kyc_done=?, hygiene_done=?, verified=? WHERE id=?",
                         (int(kyc), int(hyg), int(ver), p["id"]))
+                if p["verified"] and not ver:
+                    # She is no longer vouched for: her open quotes on care asks are withdrawn,
+                    # so no parent or family can pick her for care in the meantime.
+                    care = list(ASK_GROUPS.get("Care at Home", [])) + ["Day-care / Baby-sitting"]
+                    marks = ",".join("?" * len(care))
+                    execute("UPDATE bids SET status='Declined' WHERE provider_id=? AND status='Offered' "
+                            "AND request_id IN (SELECT id FROM requests WHERE status='Open' AND "
+                            f"(ask_group IN ({','.join('?' * len(ASK_CARE_GROUPS))}) OR category IN ({marks})))",
+                            (p["id"], *sorted(ASK_CARE_GROUPS), *care))
                 st.success("Updated.")
                 st.rerun()
             with st.expander("FSSAI certificate"):
@@ -1202,6 +1211,10 @@ def customer_discover(user):
     if only_today:
         sql += " AND l.avail_date>=?"
         params.append(today_iso())
+    # A kitchen whose certificate lapses, or is sent back, disappears from search at once —
+    # including food she listed while she was approved. fssai.py owns the rule.
+    sql += " AND " + fssai.FOOD_OK_SQL
+    params += fssai.food_ok_params()
     sql += " ORDER BY l.avail_date ASC, l.id DESC"
     rows = q(sql, tuple(params))
 
@@ -1292,10 +1305,12 @@ def customer_discover(user):
                     st.rerun()
 
     st.markdown("### Meal plans near you")
+    # Meal plans are always food, so the kitchen itself must be able to sell food today.
     plans = q(
         "SELECT pl.*, p.display_name, p.area, p.verified FROM plans pl JOIN providers p ON p.id=pl.provider_id "
-        "WHERE pl.active=1" + (" AND p.area=?" if area != "All" else "") + " ORDER BY pl.id DESC",
-        ((area,) if area != "All" else ()),
+        "WHERE pl.active=1" + (" AND p.area=?" if area != "All" else "")
+        + " AND " + fssai.KITCHEN_OK_SQL + " ORDER BY pl.id DESC",
+        ((area,) if area != "All" else ()) + tuple(fssai.kitchen_ok_params()),
     )
     if not plans:
         st.caption("No plans published in this area yet.")

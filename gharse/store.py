@@ -378,6 +378,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_offers_skill ON skill_offers (skill, area)",
     "CREATE INDEX IF NOT EXISTS ix_learn_offer ON learn_requests (offer_id)",
     "CREATE INDEX IF NOT EXISTS ix_links_skill ON skill_links (skill)",
+    # One application per person per job, one learning request per offer, one offer per
+    # skill per teacher — the code checks first, and these stop a double-click race.
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_job_apps ON job_applications (job_id, applicant_user_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_learn_req ON learn_requests (offer_id, learner_user_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_offers ON skill_offers (teacher_user_id, skill)",
     "CREATE INDEX IF NOT EXISTS ix_otp_user ON otp_codes (user_id, purpose)",
     "CREATE INDEX IF NOT EXISTS ix_reports_target ON reports (target_user_id, status)",
     "CREATE INDEX IF NOT EXISTS ix_blocks_user ON blocks (user_id)",

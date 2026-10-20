@@ -45,20 +45,34 @@ def mask_phone(p):
 
 
 # Streamlit renders Markdown even inside unsafe_allow_html markup, so escaping HTML
-# alone left a stranger's job title free to become a live link ([text](url)), a remote
-# tracking image (![](url)), or a bare auto-linked URL. Every character that means
-# something to either HTML or Markdown is emitted as a character reference: it displays
-# identically and is never read as syntax. One pass, so nothing is escaped twice.
+# alone left a stranger's text free to become a live link ([text](url)) or a remote
+# image (![](url)). Every character that means something to HTML or Markdown is emitted
+# as a character reference: it displays identically and is never read as syntax.
+#
+# That is not enough on its own. Streamlit's remark-gfm turns bare URLs and emails into
+# links AFTER references are decoded — "www.evil-upi.example" in a job description
+# became a clickable link. So an invisible WORD JOINER (U+2060) is placed exactly where
+# GFM's autolink patterns need contiguous characters: inside "http:" / "https:", between
+# "www" and ".", and after "@". The text looks the same and is never linked.
 _ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#x27;"}
 _ESCAPES.update({c: f"&#{ord(c)};" for c in "[]()!*_`#~|\\:.{}+-"})
 _ESCAPE_TABLE = str.maketrans(_ESCAPES)
+WORD_JOINER = "\u2060"
+_AUTOLINK_BREAKS = [
+    (re.compile(r"(?i)(https?)(:)"), "\\1" + WORD_JOINER + "\\2"),
+    (re.compile(r"(?i)\b(www)(\.)"), "\\1" + WORD_JOINER + "\\2"),
+    (re.compile(r"@"), "@" + WORD_JOINER),
+]
 
 
 def h(v):
-    """Escape a database value for unsafe_allow_html markup — as HTML *and* as Markdown.
-    A kitchen called "Amma's" must not break the page, a review with a script tag must
-    never run, and a job title must not turn into a link to somewhere else."""
-    return ("" if v is None else str(v)).translate(_ESCAPE_TABLE)
+    """Escape a database value for unsafe_allow_html markup — as HTML, as Markdown, and
+    against auto-linking. A kitchen called "Amma's" must not break the page, a review
+    with a script tag must never run, and nothing a stranger types becomes a link."""
+    text = "" if v is None else str(v)
+    for pattern, repl in _AUTOLINK_BREAKS:
+        text = pattern.sub(repl, text)
+    return text.translate(_ESCAPE_TABLE)
 
 def df(rows):
     return pd.DataFrame([dict(r) for r in rows])
@@ -73,13 +87,12 @@ def short_dt(v):
 
 def table(rows, cols=None, money=(), empty="Nothing yet."):
     """Render as HTML so the table follows this app's theme, not Streamlit's own."""
-    from html import escape
     data = [dict(r) for r in rows]
     if not data:
         st.caption(empty)
         return
     cols = cols or list(data[0].keys())
-    head = "".join(f"<th>{escape(c.replace('_', ' '))}</th>" for c in cols)
+    head = "".join(f"<th>{h(c.replace('_', ' '))}</th>" for c in cols)
     body = ""
     for d in data:
         cells = ""
@@ -90,20 +103,19 @@ def table(rows, cols=None, money=(), empty="Nothing yet."):
             elif c in money:
                 cells += f"<td class='num'>{inr(v)}</td>"
             elif c.endswith("_at"):
-                cells += f"<td>{escape(short_dt(v))}</td>"
+                cells += f"<td>{h(short_dt(v))}</td>"
             elif isinstance(v, bool):
                 cells += f"<td>{'yes' if v else 'no'}</td>"
             elif isinstance(v, (int, float)):
                 cells += f"<td class='num'>{v:g}</td>"
             else:
-                cells += f"<td>{escape(str(v))}</td>"
+                cells += f"<td>{h(v)}</td>"
         body += f"<tr>{cells}</tr>"
     st.markdown(f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
                 f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
 
 
 def hbar(rows, label_key, value_key, empty="No data yet."):
-    from html import escape
     data = [dict(r) for r in rows]
     if not data:
         st.caption(empty)
@@ -112,7 +124,7 @@ def hbar(rows, label_key, value_key, empty="No data yet."):
     html = ""
     for d in data:
         v = d[value_key] or 0
-        html += (f"<div class='hb'><div class='hb-l'>{escape(str(d[label_key]))}</div>"
+        html += (f"<div class='hb'><div class='hb-l'>{h(d[label_key])}</div>"
                  f"<div class='hb-t'><div class='hb-f' style='width:{100 * v / top:.1f}%'></div></div>"
                  f"<div class='hb-v'>{v:g}</div></div>")
     st.markdown(html, unsafe_allow_html=True)

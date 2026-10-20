@@ -1,5 +1,5 @@
 """Smoke test: render every page of the GharSe app for every role, with real data."""
-import os, sys, tempfile, importlib.util
+import os, re, sys, tempfile, importlib.util
 from datetime import date, datetime, timedelta
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -260,9 +260,14 @@ print("cancel ........... ok  capacity returned, no negative sold")
 # escaping: a kitchen name with a quote, and a review with a script tag
 import html as _html
 for nasty in ["Amma's <script>alert(1)</script>", "[Win ₹500](http://evil.example)",
+              "Pay advance at www.evil-upi.example now", "pay@evil.example", "HTTPS://Evil.example/x",
               "![](http://track.example/p.gif)", "visit www.evil.example", "**bold** `code` # head"]:
     out = hea.h(nasty)
-    assert _html.unescape(out) == nasty, (nasty, out)               # displays exactly as typed
+    shown = _html.unescape(out)
+    assert shown.replace("\u2060", "") == nasty, (nasty, out)          # displays exactly as typed
+    # the patterns Streamlit's remark-gfm uses to auto-link bare URLs and emails
+    assert not re.search(r"(https?://|www(?=\.))([-.\w]+)", shown, re.I), ("autolink", nasty)
+    assert not re.search(r"([-.\w+]+)@([-\w]+(?:\.[-\w]+)+)", shown), ("mailto", nasty)
     bare = out.replace("&#", "").replace("&lt", "").replace("&gt", "")
     assert not any(ch in bare for ch in "<>[]()*`!"), (nasty, out)   # no live HTML or Markdown
 assert "&&#" not in hea.h("Amma's"), "escaped twice"

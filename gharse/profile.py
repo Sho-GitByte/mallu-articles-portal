@@ -14,39 +14,57 @@
 # looking at it. Kitchen, FSSAI and food preferences are edited on their own pages,
 # and this one says which.
 #
-# Tables: users (read/write), providers and customers (read; blank name/phone filled).
+# Tables: users (read/write), providers and customers (read; a blank name is filled, and
+# the phone follows users.phone when it was blank or still the old users.phone).
+#
+# FSSAI: this page never decides who may sell food. It asks fssai.can_sell_food() and
+# fssai.food_block_reason() (imported lazily), so it can never disagree with the gate.
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 
 import streamlit as st
 
-from store import execute, hash_pw, q, verify_pw
-from ui import MAX_IMG_MB, customer_of, h, process_image, provider_of
+from store import execute, hash_pw, q, today_ist, verify_pw
+from ui import MAX_IMG_MB, customer_of, h, process_image, provider_of, safe_image
 
 PROFILE_PAGE_TITLE = "My Profile"
 
 
 # This file's name is also the name of a standard-library module, and Streamlit puts
-# the app folder first on sys.path, so `import cProfile` (which does `import profile`)
-# would land here. Re-export the three names cProfile borrows from the real one so a
-# profiler or a library that imports cProfile keeps working.
+# the app folder first on sys.path, so `import cProfile` (which does `import profile`
+# and then uses profile.run, .runctx, ._Utils, ...) or any profiling tool would land
+# here. Every name this page does not define is forwarded, on first use, to the real
+# standard-library module (PEP 562 module __getattr__). The stdlib file is loaded only
+# when something actually asks for one of its names, and only once.
+# (Renaming this file would be cleaner, but app.py imports it as `profile`.)
+_STD_CACHE = []
+
+
 def _stdlib_profile():
-    import importlib.util
-    import os
-    import sysconfig
-    path = os.path.join(sysconfig.get_paths()["stdlib"], "profile.py")
-    spec = importlib.util.spec_from_file_location("_stdlib_profile", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    if not _STD_CACHE:
+        import importlib.util
+        import os
+        import sysconfig
+        path = os.path.join(sysconfig.get_paths()["stdlib"], "profile.py")
+        spec = importlib.util.spec_from_file_location("_stdlib_profile", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _STD_CACHE.append(mod)
+    return _STD_CACHE[0]
 
 
-try:
-    _std = _stdlib_profile()
-    run, runctx, Profile = _std.run, _std.runctx, _std.Profile
-except Exception:  # pragma: no cover - a trimmed Python without the stdlib source
-    pass
+def __getattr__(name):
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(f"module 'profile' has no attribute {name!r}")
+    try:
+        std = _stdlib_profile()
+    except Exception:  # pragma: no cover - a trimmed Python without the stdlib source
+        raise AttributeError(f"module 'profile' has no attribute {name!r}") from None
+    try:
+        return getattr(std, name)
+    except AttributeError:
+        raise AttributeError(f"module 'profile' has no attribute {name!r}") from None
 
 ROLE_LABEL = {"provider": "Helper", "customer": "Customer", "admin": "Admin"}
 ROLE_LINE = {
@@ -56,13 +74,24 @@ ROLE_LINE = {
 }
 
 # Where the role-specific record is edited, so this page can point at it.
-PROVIDER_PAGE = "My Profile & Verification"
+PROVIDER_PAGE = "My Kitchen"
 CUSTOMER_PAGE = "My Preferences"
 
 BIO_MAX = 300
 MIN_PASSWORD = 8
+MAX_PW_TRIES = 5          # wrong current-password attempts per session before the form locks
+
+# fssai.py's providers.fssai_status codes, in plain words. Anything else is treated the
+# way fssai.py treats it: as not registered.
+FSSAI_STATUS_WORDS = {
+    "none": "Not registered yet",
+    "applied": "Applied, waiting for the certificate",
+    "registered": "Registered",
+}
 
 _FLASH = "profile_flash"
+_FLASH_WARN = "profile_flash_warn"
+_PW_TRIES = "profile_pw_tries"
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
 
 # A tiny scoped rule for the monogram circle. Colours come from the theme's own
@@ -107,6 +136,9 @@ def password_problem(new, confirm, username, current=None):
     """The first thing wrong with a proposed new password, or None if it is fine."""
     if len(new or "") < MIN_PASSWORD:
         return f"Your new password needs at least {MIN_PASSWORD} characters."
+    if len((new or "").strip()) < MIN_PASSWORD:
+        return (f"Your new password needs at least {MIN_PASSWORD} characters that aren't spaces — "
+                "spaces at the start or end don't count.")
     if (new or "").strip().lower() == (username or "").strip().lower():
         return "Your new password can't be the same as your username."
     if new != confirm:
@@ -133,9 +165,12 @@ def _member_since(created_at):
 
 
 def _fresh_user(user):
-    """The users row as it is now — the session copy can be a sign-in old."""
+    """The users row as it is now — the session copy can be a sign-in old. None when the
+    account no longer exists (removed while this session was open)."""
+    if not user or user.get("id") is None:
+        return None
     rows = q("SELECT * FROM users WHERE id=?", (user["id"],))
-    return dict(rows[0]) if rows else dict(user)
+    return dict(rows[0]) if rows else None
 
 
 def _linked(me):
@@ -179,24 +214,49 @@ def _flash():
     msg = st.session_state.pop(_FLASH, None)
     if msg:
         st.success(msg)
+    warn = st.session_state.pop(_FLASH_WARN, None)
+    if warn:
+        st.warning(warn)
+
+
+def pretty_phone(raw):
+    """98450 12345 for a 10-digit mobile; anything else as it was typed."""
+    n = normalise_phone(raw)
+    return f"{n[:5]} {n[5:]}" if n else (raw or "").strip()
+
+
+def fssai_status_label(p):
+    """providers.fssai_status ('none' / 'applied' / 'registered') in plain words."""
+    code = (p or {}).get("fssai_status") or "none"
+    return FSSAI_STATUS_WORDS.get(code, FSSAI_STATUS_WORDS["none"])
+
+
+def _expiry_words(raw):
+    """'valid until 05 Jan 2027' / 'expired on 01 Jan 2020', or None if no usable date."""
+    try:
+        exp = date.fromisoformat(str(raw or "").strip()[:10])
+    except ValueError:
+        return None
+    if exp < today_ist():
+        return f"expired on {exp:%d %b %Y}"
+    return f"valid until {exp:%d %b %Y}"
 
 
 def fssai_summary(p):
-    """(label, pill-class) for a helper's FSSAI position, from whatever is on file."""
-    status = (p.get("fssai_status") or "").strip()
-    number = (p.get("fssai_no") or "").strip()
-    arn = (p.get("fssai_arn") or "").strip()
-    if status:
-        low = status.lower()
-        cls = "ok" if any(w in low for w in ("verified", "approved", "active", "valid", "issued")) else "warn"
-        if any(w in low for w in ("expired", "rejected", "not")):
-            cls = "warn"
-        return status, cls
-    if number:
-        return "Number on file", "ok"
-    if arn:
-        return "Applied — waiting for the certificate", "warn"
-    return "Not added yet", "warn"
+    """A helper's FSSAI position for this page, decided entirely by fssai.py's public API:
+
+    {"status": plain-words status, "can_sell": True / False (None if fssai.py could not be
+     asked), "reason": fssai.food_block_reason() when she can't sell, else None}."""
+    out = {"status": fssai_status_label(p), "can_sell": None, "reason": None}
+    try:
+        import fssai
+        can = bool(fssai.can_sell_food(p))
+        out["can_sell"] = can
+        if not can:
+            out["reason"] = fssai.food_block_reason(p)
+    except (ImportError, AttributeError):
+        pass
+    return out
 
 
 # --------------------------------------------------------------------------- sections
@@ -209,9 +269,9 @@ def _header(me, linked):
     with st.container(border=True):
         c1, c2 = st.columns([1, 4], vertical_alignment="center")
         with c1:
-            if me.get("photo"):
-                st.image(bytes(me["photo"]), width=110)
-            else:
+            # safe_image shows a placeholder instead of raising on bytes that aren't an
+            # image, so an old bad photo can't lock anyone out of this page.
+            if not (me.get("photo") and safe_image(me["photo"], width=110)):
                 st.markdown(f"<div class='gs-mono'><span>{h(_initials(name))}</span></div>",
                             unsafe_allow_html=True)
         with c2:
@@ -248,19 +308,32 @@ def _linked_summary(me, linked):
         return
     with st.container(border=True):
         if role == "provider":
-            label, cls = fssai_summary(linked)
+            fs = fssai_summary(linked)
             kitchen = (linked.get("display_name") or "").strip()
+            status_cls = "ok" if fs["can_sell"] else "warn"
             st.markdown("**Your kitchen**")
             st.markdown(
                 (f"{h(kitchen)}" if kitchen else "<span class='muted'>No kitchen name yet</span>")
-                + f" &nbsp; <span class='muted'>FSSAI:</span> <span class='pill {cls}'>{h(label)}</span>",
+                + f" &nbsp; <span class='muted'>FSSAI:</span> "
+                  f"<span class='pill {status_cls}'>{h(fs['status'])}</span>",
                 unsafe_allow_html=True,
             )
+            if fs["can_sell"]:
+                st.markdown("<span class='pill ok'>Can sell food</span>", unsafe_allow_html=True)
+            elif fs["can_sell"] is False:
+                st.markdown("<span class='pill warn'>Can't sell food yet</span> "
+                            f"<span class='muted'>{h(fs['reason'] or '')}</span>",
+                            unsafe_allow_html=True)
+            else:
+                st.markdown("<span class='muted'>Whether you can sell food couldn't be checked "
+                            f"just now — open {h(PROVIDER_PAGE)} to see it.</span>",
+                            unsafe_allow_html=True)
             extra = []
             if (linked.get("fssai_no") or "").strip():
                 extra.append(f"Registration no. {h(linked['fssai_no'].strip())}")
-            if (linked.get("fssai_expiry") or "").strip():
-                extra.append(f"valid till {h(linked['fssai_expiry'].strip())}")
+            exp = _expiry_words(linked.get("fssai_expiry"))
+            if exp:
+                extra.append(h(exp))
             if extra:
                 st.markdown(f"<span class='muted'>{' · '.join(extra)}</span>", unsafe_allow_html=True)
             st.caption(f"Your kitchen name, FSSAI certificate, UPI ID and verification live on "
@@ -278,22 +351,55 @@ def _linked_summary(me, linked):
             )
             st.caption(f"Diet, spice level, allergies and your pickup point live on **{CUSTOMER_PAGE}** "
                        f"— every kitchen you order from sees them.")
+        other = _other_phone(me, linked)
+        if other:
+            st.warning(_other_phone_msg(me, other))
+
+
+def _other_phone(me, linked):
+    """The linked record's phone when it is set and differs from users.phone — that is
+    the number order and request WhatsApps actually go to. Else None."""
+    mine = normalise_phone(me.get("phone"))
+    theirs = (linked.get("phone") or "").strip()
+    if not mine or not theirs or normalise_phone(theirs) == mine:
+        return None
+    return theirs
+
+
+def _other_phone_msg(me, other):
+    page = PROVIDER_PAGE if me.get("role") == "provider" else CUSTOMER_PAGE
+    # st.warning renders Markdown, so the stored numbers go through h() like any DB text.
+    return (f"Order and request messages still go to {h(pretty_phone(other))}, the number on "
+            f"{page} — not {h(pretty_phone(me.get('phone')))}. Change it on {page} if that's old.")
+
+
+_LINKED_TABLE = {"provider": ("providers", "owner_name"), "customer": ("customers", "full_name")}
 
 
 def _mirror_into_linked(me, linked, name, phone):
-    """Fill the kitchen / preferences record's blank name and phone, never overwrite."""
-    if not linked or not linked.get("id"):
-        return
-    if me["role"] == "provider":
-        if name and not (linked.get("owner_name") or "").strip():
-            execute("UPDATE providers SET owner_name=? WHERE id=?", (name, linked["id"]))
-        if phone and not (linked.get("phone") or "").strip():
-            execute("UPDATE providers SET phone=? WHERE id=?", (phone, linked["id"]))
-    elif me["role"] == "customer":
-        if name and not (linked.get("full_name") or "").strip():
-            execute("UPDATE customers SET full_name=? WHERE id=?", (name, linked["id"]))
-        if phone and not (linked.get("phone") or "").strip():
-            execute("UPDATE customers SET phone=? WHERE id=?", (phone, linked["id"]))
+    """Keep the kitchen / preferences record in step with the details just saved.
+
+    The name is filled only when blank. The phone (what notify_provider / notify_customer
+    send WhatsApps to) is set when it was blank or still equal to the old users.phone, so
+    changing your number here moves your messages too; a different number someone typed
+    on the kitchen / preferences page is never overwritten. Returns that other number
+    when it is left in place, so the caller can say where messages still go."""
+    if not linked or not linked.get("id") or me.get("role") not in _LINKED_TABLE:
+        return None
+    table, name_col = _LINKED_TABLE[me["role"]]
+    if name and not (linked.get(name_col) or "").strip():
+        execute(f"UPDATE {table} SET {name_col}=? WHERE id=?", (name, linked["id"]))
+    if not phone:
+        return None
+    current = (linked.get("phone") or "").strip()
+    cur_norm = normalise_phone(current)
+    if cur_norm == phone:
+        return None
+    old = normalise_phone(me.get("phone"))
+    if not current or (old and cur_norm == old):
+        execute(f"UPDATE {table} SET phone=? WHERE id=?", (phone, linked["id"]))
+        return None
+    return current
 
 
 def _details_form(me, linked):
@@ -326,8 +432,14 @@ def _details_form(me, linked):
                       "starting with 6, 7, 8 or 9.")
     if not valid_email(email):
         errors.append("That email address doesn't look right — it should be like name@example.com.")
+    new_photo = None
     if shot is not None and shot.size > MAX_IMG_MB * 1024 * 1024:
         errors.append(f"That photo is too large. Please keep it under {MAX_IMG_MB} MB.")
+    elif shot is not None:
+        new_photo = process_image(shot)    # None for anything that isn't a readable image
+        if not new_photo:
+            errors.append("That file isn't a photo we can read. Please choose a JPG or PNG picture "
+                          "taken with your phone's camera. Nothing was saved.")
     if len(name) > 80:
         errors.append("Please keep your name under 80 characters.")
     if errors:
@@ -337,19 +449,24 @@ def _details_form(me, linked):
 
     em = (email or "").strip()
     about = (bio or "").strip()[:BIO_MAX]
-    execute("UPDATE users SET full_name=?, phone=?, email=?, bio=? WHERE id=?",
-            (name or None, norm or None, em or None, about or None, me["id"]))
+    hit = execute("UPDATE users SET full_name=?, phone=?, email=?, bio=? WHERE id=? RETURNING id",
+                  (name or None, norm or None, em or None, about or None, me["id"]))
+    if hit is None:
+        st.error("Your account couldn't be found any more, so nothing was saved. "
+                 "Please sign out and sign in again.")
+        return
     fields = dict(full_name=name or None, phone=norm or None, email=em or None, bio=about or None)
-    new_photo = process_image(shot) if shot is not None else None
     if new_photo:
         execute("UPDATE users SET photo=? WHERE id=?", (new_photo, me["id"]))
         fields["photo"] = new_photo
     elif remove:
         execute("UPDATE users SET photo=NULL WHERE id=?", (me["id"],))
         fields["photo"] = None
-    _mirror_into_linked(me, linked, name, norm)
+    other = _mirror_into_linked(me, linked, name, norm)
     _update_session(**fields)
     st.session_state[_FLASH] = "Your details are saved."
+    if other:
+        st.session_state[_FLASH_WARN] = _other_phone_msg({**me, "phone": norm}, other)
     st.rerun()
 
 
@@ -364,7 +481,6 @@ def _theme_section(me):
         execute("UPDATE users SET theme=? WHERE id=?", (chosen, me["id"]))
         _update_session(theme=chosen)
         st.session_state[_FLASH] = f"Theme changed to {themes.get(chosen)['name']}."
-        st.success("Theme changed")
         st.rerun()
 
 
@@ -378,11 +494,20 @@ def _password_form(me):
         submitted = st.form_submit_button("Change password", use_container_width=True)
     if not submitted:
         return
+    tries = dict(st.session_state.get(_PW_TRIES) or {})
+    if tries.get(me["id"], 0) >= MAX_PW_TRIES:
+        st.error("Too many wrong current passwords, so this form is locked for now. "
+                 "If you've forgotten it, ask the GharSe team to reset it.")
+        return
     rows = q("SELECT pw_hash, username FROM users WHERE id=?", (me["id"],))
     if not rows or not verify_pw(current or "", rows[0]["pw_hash"]):
+        tries[me["id"]] = tries.get(me["id"], 0) + 1
+        st.session_state[_PW_TRIES] = tries
         st.error("Your current password is wrong, so nothing was changed. Try again — if you've forgotten "
                  "it, ask the GharSe team to reset it.")
         return
+    tries.pop(me["id"], None)
+    st.session_state[_PW_TRIES] = tries
     problem = password_problem(new, confirm, rows[0]["username"], current=current)
     if problem:
         st.error(problem)
@@ -404,6 +529,10 @@ def profile_page(user):
     _flash()
 
     me = _fresh_user(user)
+    if me is None:
+        st.error("This account couldn't be found any more — it may have been removed. "
+                 "Please sign out and sign in again, or ask the GharSe team.")
+        return
     linked = _linked(me)
 
     _header(me, linked)
