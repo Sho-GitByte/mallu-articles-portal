@@ -51,10 +51,14 @@ assert len(small) < len(raw), (len(raw), len(small))
 assert Image.open(io.BytesIO(small)).size == (900, 643), Image.open(io.BytesIO(small)).size
 hea.execute("UPDATE listings SET photo=? WHERE id=?", (small, lid))
 hea.execute("UPDATE providers SET photo=? WHERE id=?", (small, pid))
+hea.execute("UPDATE providers SET fssai_status='registered', fssai_kind='basic', fssai_verified=1, "
+            "fssai_cert=?, fssai_cert_mime='image/jpeg', fssai_expiry=? WHERE id=?",
+            (small, (date.today() + timedelta(days=365)).isoformat(), pid))
+assert hea.can_sell_food(dict(hea.q("SELECT * FROM providers WHERE id=?", (pid,))[0])), "seeded kitchen must sell food"
 print(f"photo pipeline ... ok  {len(raw) // 1024}KB PNG -> {len(small) // 1024}KB JPEG")
 
 s = hea.split_money(85 * 2, "Community pickup point")
-assert s["customer_total"] == 175.0, s
+assert s["customer_total"] == 170.0 and s["delivery_fee"] == 0, s  # pickup is free
 assert (s["platform_fee"], s["ops_fee"]) == (13.6, 3.4), s
 assert s["provider_payout"] == 153.0, s
 assert round(s["platform_fee"] + s["ops_fee"] + s["provider_payout"], 2) == s["item_total"], s
@@ -128,14 +132,11 @@ print("fee split ........ ok  platform + ops + payout == item total, every price
 
 from streamlit.testing.v1 import AppTest
 
-PAGES = {
-    "admin": ["Dashboard", "Home Entrepreneurs", "Listings", "Price Guidance", "Orders", "Payouts", "Subscriptions",
-              "Custom Requests", "WhatsApp Outbox", "Fees & Settings"],
-    "provider": ["My Profile & Verification", "My Listings", "Orders Received",
-                 "Meal Plans & Subscribers", "Open Requests", "My Earnings"],
-    "customer": ["Discover Near Me", "My Orders", "My Subscriptions", "Post a Request", "My Preferences"],
-}
-USERS = {r: dict(hea.q("SELECT * FROM users WHERE role=?", (r,))[0]) for r in PAGES}
+USERS = {r: dict(hea.q("SELECT * FROM users WHERE role=?", (r,))[0]) for r in ("admin", "provider", "customer")}
+PAGES = {r: [label for label, _ in hea.role_pages(USERS[r])] for r in USERS}
+for must in ("My Profile", "Learn & Earn"):
+    assert all(must in PAGES[r] for r in PAGES), (must, PAGES)
+assert "FSSAI Certificate" in PAGES["provider"] and "FSSAI Guide" in PAGES["admin"], PAGES
 
 at = AppTest.from_file(APP, default_timeout=30)
 at.run()
@@ -165,7 +166,8 @@ assert not at.exception, at.exception
 after = hea.q("SELECT COUNT(*) c FROM orders")[0]["c"]
 assert after == before + 1, (before, after)
 o = dict(hea.q("SELECT * FROM orders ORDER BY id DESC")[0])
-assert o["status"] == "Placed" and o["customer_total"] == 100.0, o
+assert o["status"] == "Placed" and o["customer_total"] == 85.0, o  # collected from her home: no fee
+assert o["delivery_mode"] == "Self pickup", o
 assert (o["platform_fee"], o["ops_fee"], o["provider_payout"]) == (6.8, 1.7, 76.5), dict(o)
 assert hea.q("SELECT sold FROM listings WHERE id=?", (lid,))[0]["sold"] == 3
 print("place order ...... ok  ->", o["customer_total"], "paid,", o["provider_payout"], "to the cook,",
@@ -256,8 +258,14 @@ assert hea.q("SELECT sold FROM listings WHERE id=?", (lid,))[0]["sold"] >= 0
 print("cancel ........... ok  capacity returned, no negative sold")
 
 # escaping: a kitchen name with a quote, and a review with a script tag
-assert hea.h("Amma's <script>alert(1)</script>") == \
-    "Amma&#x27;s &lt;script&gt;alert(1)&lt;/script&gt;"
+import html as _html
+for nasty in ["Amma's <script>alert(1)</script>", "[Win ₹500](http://evil.example)",
+              "![](http://track.example/p.gif)", "visit www.evil.example", "**bold** `code` # head"]:
+    out = hea.h(nasty)
+    assert _html.unescape(out) == nasty, (nasty, out)               # displays exactly as typed
+    bare = out.replace("&#", "").replace("&lt", "").replace("&gt", "")
+    assert not any(ch in bare for ch in "<>[]()*`!"), (nasty, out)   # no live HTML or Markdown
+assert "&&#" not in hea.h("Amma's"), "escaped twice"
 print("escaping ......... ok  markup in DB text cannot reach the page")
 
 print("FAILURES:", fails)

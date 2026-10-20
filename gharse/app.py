@@ -12,10 +12,15 @@ import pandas as pd
 
 import store
 from catalog import *  # noqa: F401,F403 — taxonomy constants (areas, categories, ask groups…)
-from ui import (MAX_IMG_MB, csv_join, csv_split, customer_of, df, h, hbar, idx, inr, kpi,
+from ui import (MAX_IMG_MB, safe_image, csv_join, csv_split, customer_of, df, h, hbar, idx, inr, kpi,
                 mask_phone, notify, notify_customer, notify_provider, photo_of, process_image,
                 provider_of, send_whatsapp, short_dt, table, today_iso, wa_credentials, wa_link,
                 wa_number)
+import ask
+import fssai
+import learn
+import profile
+import themes
 from store import (DEFAULT_SETTINGS, admin_password_is_default, execute, hash_pw, init_db,
                    needs_rehash, now_ist, now_iso, q, set_setting, setting, today_ist, verify_pw)
 
@@ -37,6 +42,11 @@ DB_PATH = "gharse.db"
 
 # ----------------------------------------------------------------------------- HELPERS
 
+
+def delivery_label(mode):
+    """What a customer sees for a delivery mode, with its fee when there is one."""
+    fee = delivery_fee_for(mode)
+    return f"{DELIVERY_LABELS.get(mode, mode)} — " + (inr(fee) if fee else "free")
 
 def delivery_fee_for(mode):
     return {
@@ -121,6 +131,48 @@ def pay_pill(status):
     return f"<span class='pill {cls}'>{status}</span>"
 
 
+def session_user(row, mode=None):
+    """Build the signed-in user for the session. One account can be a customer and a
+    helper; `role` and `linked_id` follow the side in use, so every page — which only
+    ever looks at those two — works unchanged in either mode."""
+    user = dict(row)
+    if user["role"] == "admin":
+        return user
+    sides = {"provider": user.get("provider_id"), "customer": user.get("customer_id")}
+    if user["role"] in sides and not sides[user["role"]]:
+        sides[user["role"]] = user.get("linked_id")          # accounts made before dual roles
+    mode = mode if mode in sides and sides[mode] else next(
+        (m for m in (user["role"], "customer", "provider") if sides.get(m)), user["role"])
+    user["primary_role"], user["role"], user["linked_id"] = user["role"], mode, sides.get(mode)
+    user["has_customer"], user["has_provider"] = bool(sides["customer"]), bool(sides["provider"])
+    return user
+
+def switch_mode(user, mode):
+    fresh = q("SELECT * FROM users WHERE id=?", (user["id"],))[0]
+    st.session_state["user"] = session_user(fresh, mode)
+    st.session_state.pop("nav", None)        # the other side has different pages
+
+def add_side(user, mode):
+    """Give an existing account its other side: a customer becomes a helper, or a helper
+    starts ordering. Same login, same identity checks, same theme."""
+    me = dict(q("SELECT * FROM users WHERE id=?", (user["id"],))[0])
+    now = now_iso()
+    if mode == "provider" and not me.get("provider_id"):
+        c = customer_of(user) if user["role"] == "customer" else {}
+        pid = execute("INSERT INTO providers (display_name, owner_name, phone, area, created_at) "
+                      "VALUES (?,?,?,?,?)",
+                      (me.get("full_name") or c.get("full_name") or me["username"],
+                       me.get("full_name") or c.get("full_name"), me.get("phone") or c.get("phone"),
+                       c.get("area") or AREAS[0], now))
+        execute("UPDATE users SET provider_id=? WHERE id=?", (pid, me["id"]))
+    if mode == "customer" and not me.get("customer_id"):
+        p = provider_of(user) if user["role"] == "provider" else {}
+        cid = execute("INSERT INTO customers (full_name, phone, area, created_at) VALUES (?,?,?,?)",
+                      (me.get("full_name") or p.get("owner_name") or p.get("display_name") or me["username"],
+                       me.get("phone") or p.get("phone"), p.get("area") or AREAS[0], now))
+        execute("UPDATE users SET customer_id=? WHERE id=?", (cid, me["id"]))
+    switch_mode(user, mode)
+
 def authenticate(u, p):
     rows = q("SELECT * FROM users WHERE username=?", (u,))
     if not rows or not verify_pw(p, rows[0]["pw_hash"]):
@@ -143,8 +195,9 @@ def note_attempt(username, ok):
 
 
 def can_sell_food(p):
-    """Food is the one category we gate: verified provider + an FSSAI number on file."""
-    return bool(p.get("verified")) and bool((p.get("fssai_no") or "").strip())
+    """Food needs a verified, unexpired FSSAI certificate on file. The rule lives in
+    fssai.py so the listing form, meal plans and customer search can never disagree."""
+    return fssai.can_sell_food(p)
 
 def provider_rating(pid):
     rows = q("SELECT AVG(rating) a, COUNT(rating) c FROM orders WHERE provider_id=? AND rating IS NOT NULL", (pid,))
@@ -160,165 +213,9 @@ def repeat_customers(pid):
 
 
 # ----------------------------------------------------------------------------- THEME / CSS
-def inject_css():
-    st.markdown(
-        """
-        <style>
-        :root {
-            --bg0:#0d0a07; --panel:rgba(255,255,255,0.04);
-            --line:rgba(255,166,43,0.22); --amber:#ffa62b; --amber2:#ffc46b;
-            --mint:#3ddc97; --txt:#f6efe6;
-        }
-        .stApp {
-            background: radial-gradient(1100px 560px at 82% -12%, #2a1a08 0%, transparent 55%),
-                        linear-gradient(160deg, #0d0a07 0%, #14100a 52%, #0d0a07 100%);
-            color: var(--txt);
-        }
-        section[data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #171008 0%, #0d0a07 100%);
-            border-right: 1px solid var(--line);
-        }
-        section[data-testid="stSidebar"] * { color: var(--txt); }
-        h1,h2,h3,h4,h5,h6, p, span, label, div { color: var(--txt); }
-        .block-container { padding-top: 1.4rem; }
-
-        /* The app header sits above everything and ships white — paint it out. */
-        header[data-testid="stHeader"] { background:transparent !important; }
-        [data-testid="stToolbar"] { display:none !important; }
-
-        .stTextInput input, .stTextArea textarea, .stDateInput input,
-        div[data-baseweb="select"] > div {
-            background:#1b1409 !important; color:var(--txt) !important;
-            border:1px solid var(--line) !important; border-radius:10px !important;
-        }
-        .stTextInput input:focus, .stTextArea textarea:focus { border-color:var(--amber) !important; }
-
-        /* Current Streamlit builds render selects, number inputs and toggles through
-           react-aria rather than baseweb, so these need their own rules. */
-        [data-testid="stSelectbox"] div[role="group"],
-        [data-testid="stMultiSelect"] div[role="group"],
-        [data-testid="stNumberInputContainer"],
-        [data-testid="stDateInput"] div[role="group"] {
-            background:#1b1409 !important; border:1px solid var(--line) !important;
-            border-radius:10px !important; color:var(--txt) !important;
-        }
-        [data-testid="stSelectbox"] input, [data-testid="stMultiSelect"] input,
-        [data-testid="stNumberInputField"], [data-testid="stDateInput"] input {
-            background:transparent !important; color:var(--txt) !important; border:0 !important;
-        }
-        [data-testid="stSelectbox"] div[role="group"]:focus-within,
-        [data-testid="stNumberInputContainer"]:focus-within { border-color:var(--amber) !important; }
-        [data-testid="stNumberInputStepUp"], [data-testid="stNumberInputStepDown"] {
-            background:#241a0c !important; color:var(--amber2) !important; border:0 !important;
-        }
-        /* Dropdown menus render in a portal, outside .stApp */
-        .react-aria-Popover, [role="listbox"], [data-testid="stSelectboxVirtualDropdown"] {
-            background:#171008 !important; border:1px solid var(--line) !important; color:var(--txt) !important;
-        }
-        [role="option"] { color:var(--txt) !important; }
-        [role="option"][data-focused="true"], [role="option"]:hover {
-            background:rgba(255,166,43,.16) !important;
-        }
-        /* Checkbox / radio marks default to Streamlit red; make them the brand amber */
-        [data-testid="stCheckbox"] label[data-selected="true"] div:has(> svg),
-        [data-testid="stCheckbox"] label[data-checked="true"] div:has(> svg) {
-            background:var(--amber) !important; border-color:var(--amber) !important;
-        }
-        [data-testid="stCheckbox"] label div:has(> svg) svg polyline { stroke:#20160a !important; }
-        /* Radio: the dot is label > div > div > div:first-child, with the fill inside it */
-        [data-testid="stRadioOption"] { background:transparent !important; }
-        [data-testid="stRadioOption"] > div > div > div:first-child {
-            background:#241a0c !important; border-color:var(--line) !important;
-        }
-        [data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child {
-            border-color:var(--amber) !important;
-        }
-        [data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child > div {
-            background:var(--amber) !important;
-        }
-        /* Streamlit's heading anchor-link icons */
-        [data-testid="stHeaderActionElements"] { display:none !important; }
-        /* The text input's border lives on the wrapper, not the input */
-        [data-testid="stTextInputRootElement"] {
-            background:#1b1409 !important; border:1px solid var(--line) !important; border-radius:10px !important;
-        }
-        [data-testid="stTextInputRootElement"]:focus-within { border-color:var(--amber) !important; }
-        [data-testid="stTextInputRootElement"] input { background:transparent !important; border:0 !important; }
-
-        .stButton>button, .stDownloadButton>button, .stForm button[kind="primaryFormSubmit"],
-        [data-testid="stFormSubmitButton"] button, [data-testid="stBaseButton-secondary"],
-        [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-secondaryFormSubmit"],
-        [data-testid="stBaseButton-primaryFormSubmit"] {
-            background: linear-gradient(135deg, #f08b1d 0%, #ffa62b 100%);
-            color:#20160a; border:0; border-radius:10px; font-weight:700;
-            box-shadow:0 6px 18px rgba(255,166,43,0.22); transition:.15s;
-        }
-        .stButton>button:hover, .stDownloadButton>button:hover { filter:brightness(1.08); transform:translateY(-1px); }
-
-        /* Link buttons are anchors, not buttons, and ship unstyled */
-        [data-testid="stLinkButton"] a, [data-testid="stBaseLinkButton-secondary"],
-        [data-testid="stBaseLinkButton-primary"] {
-            background: linear-gradient(135deg, #f08b1d 0%, #ffa62b 100%) !important;
-            border:0 !important; border-radius:10px !important; font-weight:700 !important;
-            box-shadow:0 6px 18px rgba(255,166,43,0.22);
-        }
-        /* Streamlit paints the label in a nested element, so set it there too */
-        .stButton button p, .stButton button div, [data-testid="stFormSubmitButton"] button p,
-        [data-testid="stLinkButton"] a p, [data-testid="stLinkButton"] a div,
-        [data-testid="stBaseButton-secondary"] p, [data-testid="stBaseButton-primary"] p {
-            color:#20160a !important; font-weight:700 !important;
-        }
-
-        div[data-testid="stVerticalBlockBorderWrapper"] {
-            background: var(--panel); border:1px solid var(--line) !important;
-            border-radius:14px; box-shadow:0 8px 26px rgba(0,0,0,0.4);
-        }
-        .stTabs [data-baseweb="tab-list"] { gap:6px; }
-        .stTabs [data-baseweb="tab"] { background:#1b1409; border-radius:8px 8px 0 0; padding:8px 16px; }
-        .streamlit-expanderHeader, details summary { color:var(--txt) !important; }
-
-        .brand { font-size:1.35rem; font-weight:800; letter-spacing:.3px; }
-        .brand .accent { color:var(--amber2); }
-        .brand-sub { font-size:.7rem; letter-spacing:3px; color:#c2a883; margin-top:-4px; }
-        .page-title { font-size:1.7rem; font-weight:800; margin-bottom:.2rem; }
-        .page-sub { color:#c2a883; margin-bottom:1rem; }
-        .kpi { background:linear-gradient(160deg, rgba(255,166,43,.14), rgba(255,166,43,.03));
-               border:1px solid var(--line); border-radius:16px; padding:16px 18px;
-               box-shadow:0 8px 26px rgba(0,0,0,.35); height:100%; }
-        .kpi .k-label { font-size:.76rem; color:#c2a883; text-transform:uppercase; letter-spacing:1px; }
-        .kpi .k-val { font-size:1.85rem; font-weight:800; margin-top:6px; color:#fff; }
-        .pill { display:inline-block; padding:3px 10px; border-radius:999px; font-size:.72rem;
-                border:1px solid var(--line); background:rgba(255,166,43,.12); color:var(--amber2);
-                margin:2px 4px 2px 0; }
-        .pill.ok { border-color:rgba(61,220,151,.4); background:rgba(61,220,151,.12); color:var(--mint); }
-        .pill.warn { border-color:rgba(255,99,99,.4); background:rgba(255,99,99,.12); color:#ff8b8b; }
-        .price { font-size:1.5rem; font-weight:800; color:#fff; }
-        .save { color:var(--mint); font-weight:700; font-size:.85rem; }
-        .muted { color:#c2a883; font-size:.85rem; }
-
-        /* Tables and bars are rendered as HTML so they follow this theme instead of
-           Streamlit's own light one. */
-        .tbl-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px;
-                    background:rgba(255,255,255,.03); }
-        table.tbl { border-collapse:collapse; width:100%; font-size:.86rem; }
-        table.tbl th, table.tbl td { text-align:left; padding:9px 14px;
-                    border-bottom:1px solid rgba(255,166,43,.12); white-space:nowrap; }
-        table.tbl th { font-size:.68rem; letter-spacing:.1em; text-transform:uppercase;
-                    color:#c2a883; background:rgba(255,166,43,.06); font-weight:600; }
-        table.tbl tbody tr:last-child td { border-bottom:0; }
-        table.tbl td.num { text-align:right; font-variant-numeric:tabular-nums; }
-        .hb { display:grid; grid-template-columns:130px 1fr 46px; gap:12px; align-items:center;
-              margin-bottom:9px; }
-        .hb-l { font-size:.84rem; color:#c2a883; overflow:hidden; text-overflow:ellipsis; }
-        .hb-t { background:rgba(255,166,43,.08); border-radius:999px; height:14px; overflow:hidden; }
-        .hb-f { background:linear-gradient(90deg,#f08b1d,#ffc46b); height:100%; border-radius:999px; }
-        .hb-v { font-size:.84rem; font-variant-numeric:tabular-nums; text-align:right; }
-        .split { font-size:.8rem; color:#c2a883; border-top:1px dashed var(--line); margin-top:8px; padding-top:6px; }
-        #MainMenu, footer {visibility:hidden;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def inject_css(theme_key=None):
+    """All styling lives in themes.py; each person picks one of 20 themes on My Profile."""
+    st.markdown(themes.css_for(theme_key), unsafe_allow_html=True)
 
 
 def money_split_caption(s):
@@ -352,7 +249,7 @@ def login_register_view():
                         user = authenticate(u, p)
                         note_attempt(u, bool(user))
                         if user:
-                            st.session_state["user"] = user
+                            st.session_state["user"] = session_user(user)
                             st.rerun()
                         else:
                             st.error("Invalid username or password.")
@@ -390,14 +287,61 @@ def login_register_view():
                             )
                             role = "customer"
                         execute(
-                            "INSERT INTO users (username, pw_hash, role, linked_id, created_at) VALUES (?,?,?,?,?)",
-                            (ru, hash_pw(rp), role, lid, now),
+                            "INSERT INTO users (username, pw_hash, role, linked_id, provider_id, customer_id, "
+                            "created_at) VALUES (?,?,?,?,?,?,?)",
+                            (ru, hash_pw(rp), role, lid, lid if role == "provider" else None,
+                             lid if role == "customer" else None, now),
                         )
-                        st.session_state["user"] = dict(q("SELECT * FROM users WHERE username=?", (ru,))[0])
+                        st.session_state["user"] = session_user(
+                            q("SELECT * FROM users WHERE username=?", (ru,))[0])
                         st.success("Account created. Loading your portal…")
                         st.rerun()
 
 # ----------------------------------------------------------------------------- SIDEBAR NAV
+def role_pages(user):
+    """Every page a role can open, in sidebar order, as (label, render(user))."""
+    role = user["role"]
+    if role == "admin":
+        return [
+            ("Dashboard", lambda u: admin_dashboard()),
+            ("Home Entrepreneurs", admin_providers),
+            ("Listings", lambda u: admin_listings()),
+            ("Price Guidance", lambda u: admin_price_policy()),
+            ("Orders", lambda u: admin_orders()),
+            ("Payouts", lambda u: admin_payouts()),
+            ("Subscriptions", lambda u: admin_subscriptions()),
+            (ask.ASK_PAGE_TITLES["admin"], lambda u: ask.ask_admin()),
+            ("Learn & Earn", lambda u: learn.learn_admin()),
+            ("WhatsApp Outbox", lambda u: admin_outbox()),
+            ("FSSAI Guide", fssai.fssai_guide),
+            ("Fees & Settings", lambda u: admin_settings()),
+            (profile.PROFILE_PAGE_TITLE, profile.profile_page),
+        ]
+    if role == "provider":
+        return [
+            ("My Kitchen", provider_profile),
+            ("FSSAI Certificate", fssai.provider_fssai_section),
+            ("My Listings", provider_listings),
+            ("Orders Received", provider_orders),
+            ("Meal Plans & Subscribers", provider_plans),
+            (ask.ASK_PAGE_TITLES["provider"], ask.ask_helper),
+            ("Learn & Earn", learn.learn_and_earn),
+            ("My Earnings", provider_earnings),
+            ("FSSAI Guide", fssai.fssai_guide),
+            (profile.PROFILE_PAGE_TITLE, profile.profile_page),
+        ]
+    return [
+        ("Discover Near Me", customer_discover),
+        ("My Orders", customer_orders),
+        ("My Subscriptions", customer_subscriptions),
+        (ask.ASK_PAGE_TITLES["customer"], ask.ask_customer),
+        ("Learn & Earn", learn.learn_and_earn),
+        ("My Preferences", customer_prefs),
+        (profile.PROFILE_PAGE_TITLE, profile.profile_page),
+    ]
+
+ROLE_WORDS = {"admin": "Admin", "provider": "Helper", "customer": "Customer"}
+
 def sidebar_nav(user):
     with st.sidebar:
         st.markdown(
@@ -406,20 +350,29 @@ def sidebar_nav(user):
             unsafe_allow_html=True,
         )
         st.write("")
-        role = user["role"]
-        if role == "admin":
-            pages = ["Dashboard", "Home Entrepreneurs", "Listings", "Price Guidance", "Orders", "Payouts",
-                     "Subscriptions", "Custom Requests", "WhatsApp Outbox", "Fees & Settings"]
-        elif role == "provider":
-            pages = ["My Profile & Verification", "My Listings", "Orders Received",
-                     "Meal Plans & Subscribers", "Open Requests", "My Earnings"]
-        else:
-            pages = ["Discover Near Me", "My Orders", "My Subscriptions",
-                     "Post a Request", "My Preferences"]
-        choice = st.radio("Navigate", pages, label_visibility="collapsed")
+        if user["role"] != "admin":
+            if user.get("has_customer") and user.get("has_provider"):
+                sides = ["customer", "provider"]
+                pick = st.radio("Using GharSe as", sides, index=sides.index(user["role"]),
+                                format_func=lambda m: ROLE_WORDS[m], horizontal=True, key="mode_pick")
+                if pick != user["role"]:
+                    switch_mode(user, pick)
+                    st.rerun()
+            elif user["role"] == "customer":
+                if st.button("Become a helper — cook, stitch, care, teach", use_container_width=True):
+                    add_side(user, "provider")
+                    st.rerun()
+            else:
+                if st.button("Order from neighbours too", use_container_width=True):
+                    add_side(user, "customer")
+                    st.rerun()
+            st.write("")
+        labels = [label for label, _ in role_pages(user)]
+        choice = st.radio("Navigate", labels, label_visibility="collapsed", key="nav")
         st.divider()
         st.markdown(
-            f"<span class='muted'>Signed in as</span><br><b>{h(user['username'])}</b> · {role}",
+            f"<span class='muted'>Signed in as</span><br><b>{h(user['username'])}</b> · "
+            f"{ROLE_WORDS.get(user['role'], user['role'])}",
             unsafe_allow_html=True,
         )
         if st.button("Log out", use_container_width=True):
@@ -498,7 +451,7 @@ def admin_dashboard():
     else:
         st.caption("No delivered orders yet.")
 
-def admin_providers():
+def admin_providers(user=None):
     st.markdown("<div class='page-title'>Home Entrepreneurs</div>"
                 "<div class='page-sub'>Verify KYC, hygiene training and FSSAI before a kitchen can publish food.</div>",
                 unsafe_allow_html=True)
@@ -519,29 +472,33 @@ def admin_providers():
             continue
         if stat_f == "Pending verification" and p["verified"]:
             continue
-        badge = "<span class='pill ok'>Verified ✓</span>" if p["verified"] else "<span class='pill warn'>Pending</span>"
+        badge = ("<span class='pill ok'>Helper verified ✓</span>" if p["verified"]
+                 else "<span class='pill warn'>Helper pending</span>")
+        food = ("<span class='pill ok'>Can sell food</span>" if can_sell_food(p)
+                else "<span class='pill flat'>No food yet</span>")
         with st.container(border=True):
             st.markdown(
-                f"**{p['display_name'] or 'Unnamed'}** · {p['area'] or '—'} {badge}<br>"
-                f"<span class='muted'>{h(p['owner_name'] or '—')} · {h(p['phone'] or '—')} · "
-                f"FSSAI: {p['fssai_no'] or 'not provided'}</span>",
+                f"<b>{h(p['display_name'] or 'Unnamed')}</b> · {h(p['area'] or '—')} {badge} {food}<br>"
+                f"<span class='muted'>{h(p['owner_name'] or '—')} · {h(p['phone'] or '—')}</span>",
                 unsafe_allow_html=True,
             )
             st.markdown(
-                "".join(f"<span class='pill'>{c}</span>" for c in csv_split(p["categories"])[:8]),
+                "".join(f"<span class='pill'>{h(c)}</span>" for c in csv_split(p["categories"])[:8]),
                 unsafe_allow_html=True,
             )
+            # "Verified" here is the person and the kitchen — KYC, a visit, hygiene. FSSAI is
+            # approved separately below, against the certificate itself.
             a, b, c_, d = st.columns(4)
             kyc = a.checkbox("KYC done", value=bool(p["kyc_done"]), key=f"kyc{p['id']}")
             hyg = b.checkbox("Hygiene training", value=bool(p["hygiene_done"]), key=f"hyg{p['id']}")
-            ver = c_.checkbox("Verified", value=bool(p["verified"]), key=f"ver{p['id']}")
+            ver = c_.checkbox("Helper verified", value=bool(p["verified"]), key=f"ver{p['id']}")
             if d.button("Save", key=f"savep{p['id']}", use_container_width=True):
                 execute("UPDATE providers SET kyc_done=?, hygiene_done=?, verified=? WHERE id=?",
                         (int(kyc), int(hyg), int(ver), p["id"]))
                 st.success("Updated.")
                 st.rerun()
-            if not p["fssai_no"] and ver:
-                st.caption("⚠️ No FSSAI number on file — food listings stay blocked until one is added.")
+            with st.expander("FSSAI certificate"):
+                fssai.admin_fssai_panel(p, user)
 
 def admin_listings():
     st.markdown("<div class='page-title'>Listings</div>"
@@ -621,20 +578,6 @@ def admin_subscriptions():
         st.info("No subscriptions yet.")
         return
     table(rows, money=("price",))
-
-def admin_requests():
-    st.markdown("<div class='page-title'>Custom Requests</div>"
-                "<div class='page-sub'>The reverse marketplace: customers post a need, women bid.</div>",
-                unsafe_allow_html=True)
-    rows = q(
-        "SELECT r.*, c.full_name customer, (SELECT COUNT(*) FROM bids b WHERE b.request_id=r.id) bids "
-        "FROM requests r JOIN customers c ON c.id=r.customer_id ORDER BY r.id DESC"
-    )
-    if not rows:
-        st.info("No requests posted yet.")
-        return
-    table(rows, ["id", "customer", "kind", "category", "title", "area", "budget", "needed_by", "bids", "status"],
-          money=("budget",))
 
 def admin_payouts():
     st.markdown("<div class='page-title'>Payouts</div>"
@@ -879,7 +822,7 @@ def admin_settings():
 # ----------------------------------------------------------------------------- PROVIDER PAGES
 def provider_profile(user):
     p = provider_of(user)
-    st.markdown("<div class='page-title'>My Profile & Verification</div>"
+    st.markdown("<div class='page-title'>My Kitchen</div>"
                 "<div class='page-sub'>Customers buy from people they trust — this page is that trust.</div>",
                 unsafe_allow_html=True)
 
@@ -892,9 +835,7 @@ def provider_profile(user):
 
     pc = st.columns([1, 2])
     with pc[0]:
-        if p.get("photo"):
-            st.image(bytes(p["photo"]), use_container_width=True)
-        else:
+        if not safe_image(p.get("photo"), use_container_width=True):
             st.caption("No photo yet — customers scroll past listings without one.")
     with pc[1]:
         shot = st.file_uploader("Your kitchen / work photo", type=["jpg", "jpeg", "png", "webp"],
@@ -903,9 +844,13 @@ def provider_profile(user):
             if shot.size > MAX_IMG_MB * 1024 * 1024:
                 st.error(f"Please keep the photo under {MAX_IMG_MB} MB.")
             else:
-                execute("UPDATE providers SET photo=? WHERE id=?", (process_image(shot), p["id"]))
-                st.success("Photo saved.")
-                st.rerun()
+                img = process_image(shot)
+                if img is None:
+                    st.error("That file couldn't be read as a photo. Try a JPG or PNG from your camera.")
+                else:
+                    execute("UPDATE providers SET photo=? WHERE id=?", (img, p["id"]))
+                    st.success("Photo saved.")
+                    st.rerun()
 
     with st.form("prof"):
         c = st.columns(2)
@@ -927,17 +872,15 @@ def provider_profile(user):
         langs = c[1].multiselect("Languages you speak", LANGUAGES, default=csv_split(p.get("languages")))
         diet = st.selectbox("Kitchen type", DIETS, index=idx(DIETS, p.get("diet")))
         bio = st.text_area("Tell customers about your cooking / craft", p.get("bio") or "", height=90)
-        c = st.columns(2)
-        fssai = c[0].text_input("FSSAI registration number (required to sell food)", p.get("fssai_no") or "")
-        upi = c[1].text_input("Your UPI ID — this is where your earnings are sent", p.get("upi_id") or "",
-                              placeholder="name@okhdfcbank")
+        upi = st.text_input("Your UPI ID — this is where your earnings are sent", p.get("upi_id") or "",
+                            placeholder="name@okhdfcbank")
         if st.form_submit_button("Save profile", use_container_width=True):
             execute(
                 "UPDATE providers SET display_name=?, owner_name=?, phone=?, email=?, pincode=?, area=?, "
-                "radius_km=?, kinds=?, categories=?, cuisines=?, languages=?, diet=?, bio=?, fssai_no=?, "
+                "radius_km=?, kinds=?, categories=?, cuisines=?, languages=?, diet=?, bio=?, "
                 "upi_id=? WHERE id=?",
                 (display_name, owner_name, phone, email, pincode, area, radius, csv_join(kinds), csv_join(cats),
-                 csv_join(cuis), csv_join(langs), diet, bio, fssai.strip(), upi.strip(), p["id"]),
+                 csv_join(cuis), csv_join(langs), diet, bio, upi.strip(), p["id"]),
             )
             st.success("Profile saved.")
             st.rerun()
@@ -946,12 +889,12 @@ def provider_profile(user):
     st.markdown(
         f"- KYC: {'✅ done' if p.get('kyc_done') else '⬜ pending with admin'}\n"
         f"- Hygiene training: {'✅ done' if p.get('hygiene_done') else '⬜ pending with admin'}\n"
-        f"- FSSAI number: {'✅ on file' if (p.get('fssai_no') or '').strip() else '⬜ not provided'}\n"
-        f"- Admin verification: {'✅ verified' if p.get('verified') else '⬜ pending'}"
+        f"- Helper verification: {'✅ verified' if p.get('verified') else '⬜ pending'}\n"
+        f"- FSSAI certificate: {'✅ approved — you can sell food' if can_sell_food(p) else '⬜ ' + (fssai.food_block_reason(p) or 'not approved yet')}"
     )
     st.caption(
-        "Food businesses in India need FSSAI registration or a licence. If you do not have one yet, "
-        "add your phone number above and the team will walk you through the application — that help is part of the service."
+        "Selling food needs an FSSAI certificate. Upload yours, or see how to get one, on the "
+        "FSSAI Certificate and FSSAI Guide pages — the team will sit with you and fill the form if you'd like."
     )
 
 def provider_listings(user):
@@ -962,8 +905,9 @@ def provider_listings(user):
 
     food_ok = can_sell_food(p)
     if not food_ok:
-        st.warning("Food listings stay unpublished until admin verifies you **and** an FSSAI number is on file. "
-                   "Products and services can be listed right away.")
+        st.warning(f"Food listings stay unpublished until your FSSAI certificate is approved — "
+                   f"{fssai.food_block_reason(p) or 'it is waiting for admin'} "
+                   f"Products and services can be listed right away. See **FSSAI Certificate**.")
 
     with st.expander("➕ Add a listing", expanded=False):
         # Outside a form, so the price check below reacts as she types.
@@ -1007,6 +951,8 @@ def provider_listings(user):
                     st.error("Title and a price above zero are required.")
                 elif shot is not None and shot.size > MAX_IMG_MB * 1024 * 1024:
                     st.error(f"Please keep the photo under {MAX_IMG_MB} MB.")
+                elif shot is not None and process_image(shot) is None:
+                    st.error("That file couldn't be read as a photo. Try a JPG or PNG from your camera.")
                 else:
                     active = 1 if (kind != "Food" or food_ok) else 0
                     execute(
@@ -1029,10 +975,9 @@ def provider_listings(user):
         left = max(0, (l["capacity"] or 0) - (l["sold"] or 0))
         with st.container(border=True):
             c = st.columns([1, 3, 1, 1])
-            if l["photo"]:
-                c[0].image(bytes(l["photo"]), use_container_width=True)
-            else:
-                c[0].caption("No photo")
+            with c[0]:
+                if not safe_image(l["photo"], use_container_width=True):
+                    st.caption("No photo")
             c = [c[1], c[2], c[3]]
             state = "<span class='pill ok'>Live</span>" if l["active"] else "<span class='pill warn'>Unpublished</span>"
             c[0].markdown(
@@ -1059,8 +1004,10 @@ def provider_listings(user):
                 if shot is not None and st.button("Save photo", key=f"sp{l['id']}"):
                     if shot.size > MAX_IMG_MB * 1024 * 1024:
                         st.error(f"Please keep the photo under {MAX_IMG_MB} MB.")
+                    elif (img := process_image(shot)) is None:
+                        st.error("That file couldn't be read as a photo. Try a JPG or PNG from your camera.")
                     else:
-                        execute("UPDATE listings SET photo=? WHERE id=?", (process_image(shot), l["id"]))
+                        execute("UPDATE listings SET photo=? WHERE id=?", (img, l["id"]))
                         st.rerun()
 
 def provider_orders(user):
@@ -1140,7 +1087,8 @@ def provider_plans(user):
                 if not title or price <= 0:
                     st.error("Name and price are required.")
                 elif not can_sell_food(p):
-                    st.error("Meal plans need verification + FSSAI first.")
+                    st.error("Meal plans are food, so they need an approved FSSAI certificate first — "
+                             f"{fssai.food_block_reason(p) or 'it is waiting for admin'}")
                 else:
                     execute(
                         "INSERT INTO plans (provider_id, title, description, slot, days, price, diet, active, created_at) "
@@ -1177,51 +1125,6 @@ def provider_plans(user):
             st.markdown(f"- **{r['c']}** meals to cook for *{r['slot']}*")
     else:
         st.caption("No active subscribers yet.")
-
-def provider_requests(user):
-    p = provider_of(user)
-    st.markdown("<div class='page-title'>Open Requests</div>"
-                "<div class='page-sub'>Customers posting what they need. Send your price — they pick.</div>",
-                unsafe_allow_html=True)
-    rows = q("SELECT r.*, c.full_name FROM requests r JOIN customers c ON c.id=r.customer_id "
-             "WHERE r.status='Open' ORDER BY r.id DESC")
-    if not rows:
-        st.info("No open requests right now.")
-        return
-    for r in rows:
-        req = dict(r)
-        mine = q("SELECT * FROM bids WHERE request_id=? AND provider_id=?", (req["id"], p["id"]))
-        with st.container(border=True):
-            st.markdown(
-                f"**{h(req['title'])}** <span class='pill'>{h(req['category'])}</span><br>"
-                f"<span class='muted'>{h(req['area'])} · needed by {h(req['needed_by'])} · "
-                f"budget {inr(req['budget']) if req['budget'] else 'open'}</span><br>{h(req['description'] or '')}",
-                unsafe_allow_html=True,
-            )
-            if mine:
-                b = dict(mine[0])
-                st.markdown(f"<span class='pill ok'>Your offer: {inr(b['price'])} · {h(b['status'])}</span>",
-                            unsafe_allow_html=True)
-            else:
-                with st.form(f"bid{req['id']}"):
-                    c = st.columns([1, 1, 2])
-                    price = c[0].number_input("Your price (₹)", 0.0, 100000.0, float(req["budget"] or 0), step=25.0)
-                    eta = c[1].text_input("Ready by", req["needed_by"] or "")
-                    note = c[2].text_input("Message to the customer")
-                    if st.form_submit_button("Send offer"):
-                        if price <= 0:
-                            st.error("Enter a price.")
-                        else:
-                            execute(
-                                "INSERT INTO bids (request_id, provider_id, price, eta, note, status, created_at) "
-                                "VALUES (?,?,?,?,?, 'Offered', ?)",
-                                (req["id"], p["id"], price, eta, note, now_iso()),
-                            )
-                            notify_customer(req["customer_id"], "new_bid",
-                                            f"{p['display_name']} has offered {inr(price)} for your request "
-                                            f"\"{req['title']}\". Open GharSe to accept or compare offers.")
-                            st.success("Offer sent.")
-                            st.rerun()
 
 def provider_earnings(user):
     p = provider_of(user)
@@ -1315,7 +1218,8 @@ def customer_discover(user):
             shot = photo_of(l, l.get("pphoto"))
             cols = st.columns([1.1, 3, 1.2]) if shot else st.columns([3, 1.2])
             if shot:
-                cols[0].image(shot, use_container_width=True)
+                with cols[0]:
+                    safe_image(shot, use_container_width=True)
                 cols = cols[1:]
             c = cols
             badges = "<span class='pill ok'>Verified ✓</span>" if l["verified"] else ""
@@ -1344,7 +1248,13 @@ def customer_discover(user):
             # money split below updates live as quantity or delivery mode changes.
             oc = st.columns([1, 1.6, 2])
             qty = oc[0].number_input("Qty", 1, int(max(1, left)), 1, key=f"qty{l['id']}")
-            mode = oc[1].selectbox("Delivery", DELIVERY_MODES, key=f"dm{l['id']}")
+            if l["kind"] == "Service":
+                # Nothing travels: she comes to the job, or you go to her. Agree the time together.
+                mode = "Self pickup"
+                oc[1].caption("No delivery — you'll agree the time and place with her.")
+            else:
+                mode = oc[1].selectbox("How you'll get it", DELIVERY_MODES, key=f"dm{l['id']}",
+                                       format_func=delivery_label)
             note = oc[2].text_input("Any instruction (less oil, no onion…)", key=f"nt{l['id']}")
             s = split_money(l["price"] * qty, mode)
             st.markdown(money_split_caption(s), unsafe_allow_html=True)
@@ -1405,7 +1315,8 @@ def customer_discover(user):
             with st.form(f"sub{pl['id']}"):
                 sc = st.columns([1.4, 1.6])
                 start = sc[0].date_input("Start from", today_ist() + timedelta(days=1), key=f"sd{pl['id']}")
-                mode = sc[1].selectbox("Delivery", DELIVERY_MODES, key=f"sm{pl['id']}")
+                mode = sc[1].selectbox("How you'll get it", DELIVERY_MODES, key=f"sm{pl['id']}",
+                                       format_func=delivery_label)
                 if st.form_submit_button("Subscribe"):
                     prefs = (f"Diet: {cust.get('diet') or '—'} · Spice: {cust.get('spice') or '—'} · "
                              f"Avoid: {cust.get('avoid') or '—'} · Budget: "
@@ -1530,76 +1441,6 @@ def customer_subscriptions(user):
                     execute("UPDATE subscriptions SET status='Cancelled' WHERE id=?", (s["id"],))
                     st.rerun()
 
-def customer_requests(user):
-    cust = customer_of(user)
-    st.markdown("<div class='page-title'>Post a Request</div>"
-                "<div class='page-sub'>Tell the neighbourhood what you need — cooks and craftswomen send offers.</div>",
-                unsafe_allow_html=True)
-    with st.expander("➕ New request", expanded=True):
-        with st.form("newreq", clear_on_submit=True):
-            kind = st.selectbox("Type", KINDS)
-            c = st.columns(2)
-            category = c[0].selectbox("Category", CATEGORIES[kind])
-            title = c[1].text_input("What do you need? (e.g. 50 jasmine garlands)")
-            desc = st.text_area("Details", height=80)
-            c = st.columns(3)
-            budget = c[0].number_input("Budget (₹, optional)", 0.0, 500000.0, 0.0, step=100.0)
-            needed = c[1].date_input("Needed by", today_ist() + timedelta(days=3))
-            area = c[2].selectbox("Area", AREAS, index=idx(AREAS, cust.get("area")))
-            if st.form_submit_button("Post request", use_container_width=True):
-                if not title:
-                    st.error("Give the request a title.")
-                else:
-                    execute(
-                        "INSERT INTO requests (customer_id, kind, category, title, description, area, budget, "
-                        "needed_by, status, created_at) VALUES (?,?,?,?,?,?,?,?, 'Open', ?)",
-                        (cust["id"], kind, category, title, desc, area, budget or None, needed.isoformat(),
-                         now_iso()),
-                    )
-                    st.success("Posted. Offers will appear below.")
-                    st.rerun()
-
-    rows = q("SELECT * FROM requests WHERE customer_id=? ORDER BY id DESC", (cust["id"],))
-    for r in rows:
-        req = dict(r)
-        with st.container(border=True):
-            st.markdown(
-                f"**{h(req['title'])}** <span class='pill'>{h(req['status'])}</span><br>"
-                f"<span class='muted'>{h(req['category'])} · {h(req['area'])} · by {h(req['needed_by'])} · "
-                f"budget {inr(req['budget']) if req['budget'] else 'open'}</span>",
-                unsafe_allow_html=True,
-            )
-            bids = q(
-                "SELECT b.*, p.display_name, p.area, p.verified FROM bids b JOIN providers p ON p.id=b.provider_id "
-                "WHERE b.request_id=? ORDER BY b.price ASC", (req["id"],)
-            )
-            if not bids:
-                st.caption("No offers yet.")
-            for br in bids:
-                b = dict(br)
-                bc = st.columns([3, 1, 1])
-                badge = "<span class='pill ok'>Verified ✓</span>" if b["verified"] else ""
-                bc[0].markdown(
-                    f"{h(b['display_name'])} · {h(b['area'])} {badge}<br><span class='muted'>Ready by {b['eta'] or '—'} · "
-                    f"{b['note'] or ''}</span>", unsafe_allow_html=True)
-                bc[1].markdown(f"**{inr(b['price'])}**")
-                if req["status"] == "Open":
-                    if bc[2].button("Accept", key=f"ab{b['id']}", use_container_width=True):
-                        execute("UPDATE bids SET status='Accepted' WHERE id=?", (b["id"],))
-                        execute("UPDATE bids SET status='Declined' WHERE request_id=? AND id!=?", (req["id"], b["id"]))
-                        execute("UPDATE requests SET status='Assigned' WHERE id=?", (req["id"],))
-                        notify_provider(b["provider_id"], "bid_accepted",
-                                        f"Your offer of {inr(b['price'])} for \"{req['title']}\" was accepted by "
-                                        f"{cust.get('full_name') or 'a customer'} in {req['area']}. "
-                                        f"Needed by {req['needed_by']}.")
-                        st.rerun()
-                else:
-                    bc[2].markdown(f"<span class='pill'>{h(b['status'])}</span>", unsafe_allow_html=True)
-            if req["status"] == "Assigned":
-                if st.button("Mark completed", key=f"rc{req['id']}"):
-                    execute("UPDATE requests SET status='Completed' WHERE id=?", (req["id"],))
-                    st.rerun()
-
 def customer_prefs(user):
     cust = customer_of(user)
     st.markdown("<div class='page-title'>My Preferences</div>"
@@ -1636,32 +1477,13 @@ def customer_prefs(user):
 
 # ----------------------------------------------------------------------------- ROUTER
 def dispatch(user, page):
-    role = user["role"]
-    if role == "admin":
-        {
-            "Dashboard": admin_dashboard, "Home Entrepreneurs": admin_providers, "Listings": admin_listings,
-            "Price Guidance": admin_price_policy,
-            "Orders": admin_orders, "Payouts": admin_payouts, "Subscriptions": admin_subscriptions,
-            "Custom Requests": admin_requests, "WhatsApp Outbox": admin_outbox,
-            "Fees & Settings": admin_settings,
-        }[page]()
-    elif role == "provider":
-        {
-            "My Profile & Verification": provider_profile, "My Listings": provider_listings,
-            "Orders Received": provider_orders, "Meal Plans & Subscribers": provider_plans,
-            "Open Requests": provider_requests, "My Earnings": provider_earnings,
-        }[page](user)
-    else:
-        {
-            "Discover Near Me": customer_discover, "My Orders": customer_orders,
-            "My Subscriptions": customer_subscriptions, "Post a Request": customer_requests,
-            "My Preferences": customer_prefs,
-        }[page](user)
+    pages = dict(role_pages(user))
+    pages.get(page, next(iter(pages.values())))(user)
 
 def main():
     init_db()
-    inject_css()
     user = st.session_state.get("user")
+    inject_css((user or {}).get("theme"))
     if not user:
         login_register_view()
         return

@@ -10,7 +10,7 @@ from html import escape as esc
 import pandas as pd
 import streamlit as st
 
-from store import execute, now_iso, q, today_ist
+from store import execute, now_iso, q, setting, today_ist
 
 MAX_IMG_MB = 5
 
@@ -44,12 +44,21 @@ def mask_phone(p):
     return d[:2] + "•" * (len(d) - 4) + d[-2:]
 
 
-def h(v):
-    """Escape a database value on its way into unsafe_allow_html markup. A kitchen
-    called "Amma's" must not break the page, and a review containing a script tag
-    must never run."""
-    return esc("" if v is None else str(v), quote=True)
+# Streamlit renders Markdown even inside unsafe_allow_html markup, so escaping HTML
+# alone left a stranger's job title free to become a live link ([text](url)), a remote
+# tracking image (![](url)), or a bare auto-linked URL. Every character that means
+# something to either HTML or Markdown is emitted as a character reference: it displays
+# identically and is never read as syntax. One pass, so nothing is escaped twice.
+_ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#x27;"}
+_ESCAPES.update({c: f"&#{ord(c)};" for c in "[]()!*_`#~|\\:.{}+-"})
+_ESCAPE_TABLE = str.maketrans(_ESCAPES)
 
+
+def h(v):
+    """Escape a database value for unsafe_allow_html markup — as HTML *and* as Markdown.
+    A kitchen called "Amma's" must not break the page, a review with a script tag must
+    never run, and a job title must not turn into a link to somewhere else."""
+    return ("" if v is None else str(v)).translate(_ESCAPE_TABLE)
 
 def df(rows):
     return pd.DataFrame([dict(r) for r in rows])
@@ -109,26 +118,54 @@ def hbar(rows, label_key, value_key, empty="No data yet."):
     st.markdown(html, unsafe_allow_html=True)
 
 
+# Phone cameras are big; anything past this is a decompression bomb, not a photo.
+MAX_IMAGE_PIXELS = 40_000_000
+
+
 def process_image(uploaded, max_px=900):
-    """Downscale an upload so the database stays small. Falls back to the raw bytes
-    if Pillow is unavailable — a slightly heavy row beats a lost photo."""
+    """Return the upload as a downscaled JPEG, or None if it is not a readable image.
+
+    It used to fall back to the raw bytes, which meant any file renamed .jpg was stored
+    as a photo — and then crashed st.image on every later page load, with no way for
+    the owner to remove it. A file that will not decode is now refused, never stored."""
     if uploaded is None:
         return None
-    raw = uploaded.getvalue()
+    raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else bytes(uploaded)
     if not raw:
         return None
     try:
         import io
+        import warnings
         from PIL import Image
-        im = Image.open(io.BytesIO(raw))
-        if im.mode in ("RGBA", "P", "LA"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            probe = Image.open(io.BytesIO(raw))
+            if probe.width * probe.height > MAX_IMAGE_PIXELS:
+                return None
+            probe.verify()                      # catches truncated and corrupt files
+            im = Image.open(io.BytesIO(raw))    # verify() leaves the image unusable
+            im.load()
+        if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
         im.thumbnail((max_px, max_px))
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=82)
         return buf.getvalue()
     except Exception:
-        return raw
+        return None
+
+
+def safe_image(data, caption=None, **kwargs):
+    """st.image that cannot take the page down. Rows written before uploads were
+    validated may hold bytes that are not an image; show a placeholder instead."""
+    if not data:
+        return False
+    try:
+        st.image(bytes(data), caption=caption, **kwargs)
+        return True
+    except Exception:
+        st.caption("Photo couldn't be shown — upload it again.")
+        return False
 
 
 def photo_of(row, fallback=None):
@@ -228,3 +265,18 @@ def notify_customer(customer_id, kind, body, order_id=None):
     rows = q("SELECT full_name, phone FROM customers WHERE id=?", (customer_id,))
     if rows:
         notify(rows[0]["phone"], rows[0]["full_name"], "customer", kind, body, order_id)
+
+
+def split_on_top(amount):
+    """GharSe Social pricing: the platform fee is added ON TOP of what the host or owner
+    asks, so they keep every rupee of their price and the guest pays the 10%. (Food is
+    the other way round — split_money in app.py takes it out of the cook's price.) Both
+    rates come from the same settings, and both are always shown itemised.
+
+    A ₹399 ticket: host keeps ₹399, platform ₹31.92, processing ₹7.98, guest pays ₹438.90.
+    """
+    base = round(float(amount), 2)
+    platform = round(base * setting("platform_pct", float) / 100.0, 2)
+    ops = round(base * setting("ops_pct", float) / 100.0, 2)
+    return {"base": base, "platform_fee": platform, "ops_fee": ops,
+            "customer_total": round(base + platform + ops, 2), "host_payout": base}

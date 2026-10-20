@@ -33,8 +33,8 @@ DEFAULT_SETTINGS = {
     "platform_pct": "8",         # onboarding, verification, the app itself
     "ops_pct": "2",              # payment processing, support, coordination
     "commission_pct": "8",       # legacy single rate; kept so old databases still read
-    "delivery_fee": "15",        # home delivery, per order
-    "pickup_point_fee": "5",     # a batched drop at a PG / office / apartment gate
+    "delivery_fee": "0",         # she brings it over; free unless admin sets a fee
+    "pickup_point_fee": "0",     # a batched drop at a PG / office / apartment gate
     "self_pickup_fee": "0",
     "min_order": "60",
 }
@@ -162,7 +162,9 @@ def q(sql, params=()):
 # has no id column, so it must never get a RETURNING clause.
 _ID_TABLES = {"users", "providers", "customers", "listings", "orders", "plans",
               "subscriptions", "requests", "bids", "payouts", "notifications",
-              "jobs", "job_applications", "skill_offers", "learn_requests", "skill_links"}
+              "jobs", "job_applications", "skill_offers", "learn_requests", "skill_links",
+              "otp_codes", "reports", "blocks", "events", "event_bookings", "rentals",
+              "rental_requests", "social_payouts"}
 _INSERT_RE = re.compile(r"^\s*INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
 
 def execute(sql, params=()):
@@ -189,7 +191,14 @@ SCHEMA = [
         pw_hash TEXT NOT NULL,
         role TEXT NOT NULL,
         linked_id INTEGER,
+        customer_id INTEGER, provider_id INTEGER,
         theme TEXT, full_name TEXT, phone TEXT, email TEXT, bio TEXT, photo {BLOB},
+        interests TEXT,
+        phone_verified INTEGER DEFAULT 0, phone_verified_at TEXT,
+        kyc_status TEXT, kyc_method TEXT, kyc_ref TEXT, kyc_name TEXT, dob TEXT,
+        pan_masked TEXT, aadhaar_last4 TEXT, kyc_selfie {BLOB},
+        kyc_consent_at TEXT, kyc_submitted_at TEXT, kyc_reviewed_at TEXT,
+        kyc_reviewed_by INTEGER, kyc_note TEXT,
         created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS providers (
@@ -203,6 +212,7 @@ SCHEMA = [
         photo {BLOB}, upi_id TEXT,
         fssai_status TEXT, fssai_kind TEXT, fssai_arn TEXT, fssai_expiry TEXT,
         fssai_cert {BLOB}, fssai_cert_mime TEXT,
+        fssai_verified INTEGER DEFAULT 0, fssai_verified_at TEXT, fssai_verified_by INTEGER,
         created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS customers (
@@ -245,6 +255,7 @@ SCHEMA = [
         customer_id INTEGER, kind TEXT, category TEXT, title TEXT, description TEXT,
         area TEXT, budget {MONEY}, needed_by TEXT, status TEXT,
         ask_group TEXT, consideration TEXT, safety_ack INTEGER DEFAULT 0,
+        closed_reason TEXT,
         created_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS bids (
@@ -295,6 +306,56 @@ SCHEMA = [
         skill TEXT, title TEXT, url TEXT, source TEXT, language TEXT,
         added_by INTEGER, created_at TEXT
     )""",
+    # One-time codes for phone verification. Only a salted hash is stored, never the code.
+    """CREATE TABLE IF NOT EXISTS otp_codes (
+        id {PK},
+        user_id INTEGER, phone TEXT, code_hash TEXT, purpose TEXT, expires_at TEXT,
+        attempts INTEGER DEFAULT 0, used INTEGER DEFAULT 0, created_at TEXT
+    )""",
+    # Anyone can report anyone or anything; repeated reports suspend.
+    """CREATE TABLE IF NOT EXISTS reports (
+        id {PK},
+        reporter_user_id INTEGER, target_kind TEXT, target_id INTEGER, target_user_id INTEGER,
+        reason TEXT, details TEXT, status TEXT, resolved_by INTEGER, resolved_at TEXT,
+        created_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS blocks (
+        id {PK},
+        user_id INTEGER, blocked_user_id INTEGER, created_at TEXT
+    )""",
+    # GharSe Social — house parties, friends meets, plan & play, hangouts, trips.
+    """CREATE TABLE IF NOT EXISTS events (
+        id {PK},
+        host_user_id INTEGER, kind TEXT, title TEXT, description TEXT, theme TEXT,
+        rules TEXT, activities TEXT, interests TEXT, area TEXT, venue_hint TEXT,
+        address TEXT, starts_at TEXT, ends_at TEXT, ticket_price {MONEY}, capacity INTEGER,
+        min_age INTEGER DEFAULT 18, refund_rule TEXT, status TEXT, photo {BLOB}, created_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS event_bookings (
+        id {PK},
+        event_id INTEGER, user_id INTEGER, qty INTEGER,
+        ticket_total {MONEY}, platform_fee {MONEY}, ops_fee {MONEY}, customer_total {MONEY},
+        host_payout {MONEY}, payment_status TEXT, payment_ref TEXT, status TEXT, created_at TEXT
+    )""",
+    # Rooms and PG beds people advertise in their own neighbourhood.
+    """CREATE TABLE IF NOT EXISTS rentals (
+        id {PK},
+        owner_user_id INTEGER, kind TEXT, title TEXT, description TEXT, area TEXT,
+        rent {MONEY}, deposit {MONEY}, available_from TEXT, sharing TEXT, gender_pref TEXT,
+        amenities TEXT, address TEXT, photo {BLOB}, status TEXT, created_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS rental_requests (
+        id {PK},
+        rental_id INTEGER, user_id INTEGER, note TEXT, booking_amount {MONEY},
+        platform_fee {MONEY}, ops_fee {MONEY}, customer_total {MONEY},
+        payment_status TEXT, payment_ref TEXT, status TEXT, created_at TEXT
+    )""",
+    # Hosts and room owners need not be food helpers, so their payouts are by account.
+    """CREATE TABLE IF NOT EXISTS social_payouts (
+        id {PK},
+        user_id INTEGER, amount {MONEY}, items_count INTEGER, source TEXT,
+        method TEXT, ref TEXT, created_at TEXT
+    )""",
     """CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value TEXT
     )""",
@@ -317,18 +378,33 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_offers_skill ON skill_offers (skill, area)",
     "CREATE INDEX IF NOT EXISTS ix_learn_offer ON learn_requests (offer_id)",
     "CREATE INDEX IF NOT EXISTS ix_links_skill ON skill_links (skill)",
+    "CREATE INDEX IF NOT EXISTS ix_otp_user ON otp_codes (user_id, purpose)",
+    "CREATE INDEX IF NOT EXISTS ix_reports_target ON reports (target_user_id, status)",
+    "CREATE INDEX IF NOT EXISTS ix_blocks_user ON blocks (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_events_live ON events (status, starts_at)",
+    "CREATE INDEX IF NOT EXISTS ix_bookings_event ON event_bookings (event_id)",
+    "CREATE INDEX IF NOT EXISTS ix_rentals_live ON rentals (status, area)",
+    "CREATE INDEX IF NOT EXISTS ix_rental_req ON rental_requests (rental_id)",
 ]
 
 # Columns added after the first release. Kept so a database created by an earlier
 # version keeps working instead of needing a wipe.
 NEW_COLUMNS = {
-    "users": {"theme": "TEXT", "full_name": "TEXT", "phone": "TEXT", "email": "TEXT",
-              "bio": "TEXT", "photo": "{BLOB}"},
+    "users": {"customer_id": "INTEGER", "provider_id": "INTEGER",
+              "theme": "TEXT", "full_name": "TEXT", "phone": "TEXT", "email": "TEXT",
+              "bio": "TEXT", "photo": "{BLOB}", "interests": "TEXT",
+              "phone_verified": "INTEGER DEFAULT 0", "phone_verified_at": "TEXT",
+              "kyc_status": "TEXT", "kyc_method": "TEXT", "kyc_ref": "TEXT", "kyc_name": "TEXT",
+              "dob": "TEXT", "pan_masked": "TEXT", "aadhaar_last4": "TEXT", "kyc_selfie": "{BLOB}",
+              "kyc_consent_at": "TEXT", "kyc_submitted_at": "TEXT", "kyc_reviewed_at": "TEXT",
+              "kyc_reviewed_by": "INTEGER", "kyc_note": "TEXT"},
     "providers": {"photo": "{BLOB}", "upi_id": "TEXT",
                   "fssai_status": "TEXT", "fssai_kind": "TEXT", "fssai_arn": "TEXT",
-                  "fssai_expiry": "TEXT", "fssai_cert": "{BLOB}", "fssai_cert_mime": "TEXT"},
+                  "fssai_expiry": "TEXT", "fssai_cert": "{BLOB}", "fssai_cert_mime": "TEXT",
+                  "fssai_verified": "INTEGER DEFAULT 0", "fssai_verified_at": "TEXT",
+                  "fssai_verified_by": "INTEGER"},
     "requests": {"ask_group": "TEXT", "consideration": "TEXT",
-                 "safety_ack": "INTEGER DEFAULT 0"},
+                 "safety_ack": "INTEGER DEFAULT 0", "closed_reason": "TEXT"},
     "listings": {"photo": "{BLOB}", "cost_price": "{MONEY}"},
     "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT",
                "ops_fee": "{MONEY} DEFAULT 0"},
@@ -364,6 +440,10 @@ def init_db(force=False):
     for stmt in INDEXES:
         execute(stmt)
     migrate()
+    # One account can be a customer and a helper at once. Accounts made before that
+    # carry their single side in linked_id; copy it across once.
+    execute("UPDATE users SET provider_id = linked_id WHERE role='provider' AND provider_id IS NULL")
+    execute("UPDATE users SET customer_id = linked_id WHERE role='customer' AND customer_id IS NULL")
     if not q("SELECT 1 FROM users WHERE role='admin'"):
         execute("INSERT INTO users (username, pw_hash, role, created_at) VALUES (?,?,?,?)",
                 ("admin", hash_pw(admin_password()), "admin", now_iso()))

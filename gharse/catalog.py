@@ -43,7 +43,16 @@ LANGUAGES = ["Kannada", "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Ben
 SLOTS = ["Breakfast (7–10 AM)", "Lunch (12–2:30 PM)", "Evening (4–6 PM)", "Dinner (7–9:30 PM)", "Anytime"]
 UNITS = ["per meal", "per plate", "per piece", "per kg", "per dozen", "per set", "per hour", "per job"]
 
-DELIVERY_MODES = ["Home delivery", "Community pickup point", "Self pickup"]
+# The helper lives a few minutes away, so the customer collects — free — by default. A
+# rider fee was the one cost that made a home meal dearer than it needed to be; walking
+# over removes it entirely. The stored values stay the same; DELIVERY_LABELS is what
+# people see.
+DELIVERY_MODES = ["Self pickup", "Community pickup point", "Home delivery"]
+DELIVERY_LABELS = {
+    "Self pickup": "Collect from her home",
+    "Community pickup point": "Pickup point (PG / office / apartment gate)",
+    "Home delivery": "She brings it to you",
+}
 
 ORDER_FLOW = ["Placed", "Accepted", "Preparing", "Ready", "Out for delivery", "Delivered"]
 ORDER_STATUSES = ORDER_FLOW + ["Cancelled"]
@@ -146,3 +155,46 @@ SKILLS = {
 }
 TEACH_MODES = ["At my home", "At the learner's home", "Video call", "Group class nearby"]
 SKILL_LEVELS = ["Beginner", "Intermediate", "Advanced"]
+
+
+# ----------------------------------------------------------------------------- SAFETY & KYC
+KYC_STATUSES = ["none", "pending", "verified", "rejected"]
+# What the founder wants proved before anyone hosts, enters a home, or teaches in one.
+KYC_GATED = {"host an event", "take up care work", "teach at home", "list a room"}
+REPORT_REASONS = [
+    "Didn't turn up / cancelled at the last minute",
+    "Asked for money outside the app",
+    "Rude, abusive or threatening",
+    "Unsafe — made me feel unsafe",
+    "Fake profile or not the person in the photo",
+    "Food safety or hygiene problem",
+    "Something else",
+]
+# Reports from this many different people put an account on hold until admin reviews.
+REPORTS_TO_SUSPEND = 3
+
+# ----------------------------------------------------------------------------- GHARSE SOCIAL
+EVENT_KINDS = ["House party", "Friends meet", "Plan & play", "Hangout", "Trip"]
+EVENT_HINTS = {
+    "House party": "A ticketed party at your place — your theme, your rules, your games.",
+    "Friends meet": "Meet new people around a shared interest.",
+    "Plan & play": "Board games, cricket, a jam session — come and play.",
+    "Hangout": "Coffee, a walk, a movie — low-key and nearby.",
+    "Trip": "A day trip or a weekend away, planned together.",
+}
+INTERESTS = [
+    "Board games", "Cricket", "Football", "Badminton", "Running", "Cycling", "Trekking",
+    "Music", "Singing", "Dance", "Movies", "Books", "Cooking", "Photography", "Art & craft",
+    "Tech", "Startups", "Spirituality", "Yoga", "Pets", "Travel", "Food walks", "Gaming",
+]
+REFUND_RULES = [
+    "Full refund up to 24 hours before",
+    "Full refund up to 48 hours before",
+    "50% refund up to 24 hours before",
+    "No refunds",
+]
+RENTAL_KINDS = ["Room", "PG bed", "Flat share", "Whole flat"]
+SHARING = ["Private", "Twin sharing", "Triple sharing", "Dorm"]
+GENDER_PREF = ["Anyone", "Women only", "Men only", "Family"]
+AMENITIES = ["Wi-Fi", "Food included", "AC", "Attached bathroom", "Washing machine",
+             "Power backup", "Parking", "Housekeeping", "Gym", "Near metro"]
