@@ -62,6 +62,11 @@ Supabase's free tier is enough to start:
    ```
 
    Keep `?sslmode=require` — Supabase needs it.
+
+   Supabase databases are UTF-8, which GharSe needs (names, "—", "₹", Malayalam and Kannada
+   text). If you create a Postgres database yourself, create it with
+   `CREATE DATABASE gharse ENCODING 'UTF8' TEMPLATE template0;` — a server initialised with the
+   C locale defaults to SQL_ASCII and will refuse that text.
 4. Save. The app restarts, creates its schema in Postgres and is now durable.
 
 Nothing else changes: `store.py` speaks both dialects, so the same code runs on your laptop

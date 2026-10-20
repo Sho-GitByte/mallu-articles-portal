@@ -41,6 +41,8 @@ DEFAULT_SETTINGS = {
     "grievance_name": "",
     "grievance_email": "",
     "grievance_phone": "",
+    # GharSe Social: paid seats one account may hold on an event while its payment is checked.
+    "social_seat_cap": "4",
 }
 
 DEMO_ADMIN_PASSWORD = "admin@123"
@@ -341,14 +343,16 @@ SCHEMA = [
         id {PK},
         event_id INTEGER, user_id INTEGER, qty INTEGER,
         ticket_total {MONEY}, platform_fee {MONEY}, ops_fee {MONEY}, customer_total {MONEY},
-        host_payout {MONEY}, payment_status TEXT, payment_ref TEXT, status TEXT, created_at TEXT
+        host_payout {MONEY}, payment_status TEXT, payment_ref TEXT, status TEXT, created_at TEXT,
+        claimed_at TEXT
     )""",
     # Rooms and PG beds people advertise in their own neighbourhood.
     """CREATE TABLE IF NOT EXISTS rentals (
         id {PK},
         owner_user_id INTEGER, kind TEXT, title TEXT, description TEXT, area TEXT,
         rent {MONEY}, deposit {MONEY}, available_from TEXT, sharing TEXT, gender_pref TEXT,
-        amenities TEXT, address TEXT, photo {BLOB}, status TEXT, created_at TEXT
+        amenities TEXT, address TEXT, photo {BLOB}, status TEXT, created_at TEXT,
+        prehold_status TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS rental_requests (
         id {PK},
@@ -420,6 +424,10 @@ NEW_COLUMNS = {
     "listings": {"photo": "{BLOB}", "cost_price": "{MONEY}"},
     "orders": {"payment_status": "TEXT", "payment_ref": "TEXT", "paid_at": "TEXT",
                "ops_fee": "{MONEY} DEFAULT 0"},
+    # When the guest submitted the payment reference (the hold's age is created_at).
+    "event_bookings": {"claimed_at": "TEXT"},
+    # The status a listing had when the team put it On hold, set in the same UPDATE.
+    "rentals": {"prehold_status": "TEXT"},
 }
 
 def _render(sql):

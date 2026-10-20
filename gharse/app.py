@@ -835,7 +835,13 @@ def admin_settings():
         g_name = c[0].text_input("Name", setting("grievance_name", str), key="g_name")
         g_email = c[1].text_input("Email", setting("grievance_email", str), key="g_email")
         g_phone = c[2].text_input("Phone", setting("grievance_phone", str), key="g_phone")
+        seat_cap = st.number_input(
+            "GharSe Social — paid seats one account can hold while its payment is checked", 1, 10,
+            min(10, max(1, setting("social_seat_cap", int))), step=1,
+            help="Stops one account sitting on a party's seats with an unpaid claim. A bigger group "
+                 "books from more than one account, or you raise this.")
         if st.form_submit_button("Save settings", use_container_width=True):
+            set_setting("social_seat_cap", int(seat_cap))
             set_setting("grievance_name", g_name.strip())
             set_setting("grievance_email", g_email.strip())
             set_setting("grievance_phone", g_phone.strip())
