@@ -175,6 +175,9 @@ markup, a link or a tracking image. Photos are re-encoded on upload; a file that
 image is refused rather than stored.
 
 The app writes plain SQL with `?` placeholders and never imports a database driver.
+A dropped connection to a sleeping Postgres is retried for reads only: a write may already have
+committed when the connection went, so it is sent once, on a connection checked first if it has
+been idle, and never repeated — no order, payment or refund can be recorded twice that way.
 `test_sql_dialects.py` parses every statement the project can emit under both dialects, so a
 sqlite-only construct cannot quietly break production.
 
