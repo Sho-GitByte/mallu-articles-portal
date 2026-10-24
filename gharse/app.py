@@ -1585,5 +1585,21 @@ def on_hold(row):
                 "the grievance officer — they have to respond.")
     st.markdown(safety.grievance_line(), unsafe_allow_html=True)
 
+def connection_lost_notice():
+    """A write on Postgres is never sent twice (store._run), so when the connection drops
+    while something is being saved, nobody can say whether it was. Say exactly that, so
+    the person looks before doing it again rather than paying or booking twice."""
+    st.warning("The connection to GharSe's database dropped while this page was working, so the "
+               "last thing you did may or may not have been saved. Reload the page and check "
+               "before you try it again — especially a payment, a booking or a payout.")
+    if st.button("Reload", type="primary"):
+        st.rerun()
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if not store._connection_lost(e):
+            raise
+        store._reset()
+        connection_lost_notice()
