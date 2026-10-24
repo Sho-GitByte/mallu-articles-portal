@@ -13,15 +13,22 @@
 #      details are hidden again while either account is on hold, while the owner's identity
 #      is no longer verified, or while the team has the listing on hold (the guest is told
 #      only that the team is looking into it, in the words a paused payment uses).
-#   4. Optional booking amount — the owner sets a token or first month. GharSe adds its
-#      platform and processing fees ON TOP (ui.split_on_top), the guest pays the platform
-#      UPI and claims it with the reference, and the team confirms it on Rentals Admin.
+#   4. Optional booking amount — the owner sets a token or first month (only while the
+#      listing is live, paused or let — not while the team has it on hold or removed it).
+#      GharSe adds its platform and processing fees ON TOP (ui.split_on_top), the guest pays
+#      the platform UPI and claims it with the reference, and the team confirms it on
+#      Rentals Admin.
 #   5. The team pays the owner what she asked for and records it in social_payouts
 #      (source "rental").
 #   6. The stay ends. Relisting a let SINGLE place (a whole flat, a private room) closes its
 #      tenancy and tells the guest. A shared place is relisted with its tenants left as they
 #      are — a PG with one bed free is still home to the others — and the owner closes one
 #      tenancy at a time with "End stay" on that guest's request, which tells the guest.
+#
+# A listing the team REMOVES closes every open request on it, and each guest is told: money
+# GharSe holds (Claimed or Paid) is flagged for refund, and a booking the team had already
+# released to the owner or paid out is closed with its money state kept — a released booking
+# is still paid out — so the owner's message promises refunds only where they happen.
 #
 # Tables: rentals, rental_requests, social_payouts.
 #
@@ -48,9 +55,12 @@
 # again once it has committed: it backs off to a booking already confirmed, and otherwise to
 # the request with the smaller id, so whatever order they commit in exactly one claim keeps
 # the place. The one that backs off is closed as Refund check (its reference kept for the
-# team) and that guest is told. A booking amount the owner sets on the place in that same
-# instant is checked again the same way and, if a claim got there first, put back to what
-# it was before, so no guest is asked to pay for a place someone else holds.
+# team) and that guest is told — on the page too, whichever claimer's re-check closed it: the
+# claim is read back afterwards, never assumed to have stood, and the request card says it
+# too if a rival's claim lands only after that read-back. A booking amount the owner sets
+# on the place in that same instant is checked again the same way and, if a claim got there
+# first, put back to what it was before, so no guest is asked to pay for a place someone else
+# holds.
 #
 # The owner's standing is re-checked INSIDE each of those statements, not just on the page:
 # an owner who is on hold or whose identity is no longer verified cannot accept a visit
@@ -63,9 +73,26 @@
 # before it is paid out.
 # _PAYABLE_SQL (its listing half and owner half) / _freeze_reason are the one definition of
 # what can be paid out.
+#
+# A write can fail AFTER it has committed: store.py sends a Postgres write once and raises if
+# the connection drops mid-write, so the page sees an error for a change that may well have
+# happened. Every change made of several statements is therefore ordered, or repaired, so that
+# stopping between any two of them leaves no money unaccounted and nothing counted twice:
+#   * mark_let flags the turned-away guests' money for refund BEFORE the listing turns Let;
+#     stopped half-way, the place is still live and Mark let finishes it.
+#   * finish_interrupted, run whenever Rentals Admin opens, completes the rest — a claim whose
+#     post-commit re-check never ran is closed if it has to give way (and confirm_payment
+#     refuses it meanwhile); requests a removal left open are closed; and bookings flipped to
+#     Paid out but not yet counted in the owner's payout rows are added to her latest row, once
+#     it is older than _PAYOUT_SETTLE, so a payout still being recorded is never counted twice.
+#   * A payout that stopped before reaching every booking leaves the rest still owed, and Owner
+#     payouts warns that money went to that owner minutes ago before anyone sends it again.
+#   * set_booking_amount's take-back needs no repair: an amount left on a single place someone
+#     else holds can't be paid (claim_payment refuses it, and the guest's page says it's taken).
+# Everything else is a single money write followed only by messages.
 
 import re
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import quote
 
 import streamlit as st
@@ -73,7 +100,7 @@ import streamlit as st
 import kyc
 import safety
 from catalog import AMENITIES, AREAS, GENDER_PREF, RENTAL_KINDS, SHARING
-from store import execute, now_iso, q, setting, today_ist
+from store import execute, now_iso, now_ist, q, setting, today_ist
 from ui import (
     MAX_IMG_MB,
     csv_join,
@@ -187,7 +214,9 @@ def _uid(user):
 
 def _flash(key):
     msg = st.session_state.pop(key, None)
-    if msg:
+    if isinstance(msg, tuple):          # ("warn", text): something to check, not a success
+        st.warning(msg[1])
+    elif msg:
         st.success(msg)
 
 
@@ -687,14 +716,21 @@ def set_listing_status(rental_id, uid, new_status, from_statuses):
                    "RETURNING id", (new_status, rental_id, uid, *from_statuses))
 
 
-def _close_open_requests(rental_id, why, refund_paid, keep=None):
+def _close_open_requests(rental_id, why, refund_paid, keep=None, leave_unpaid=False):
     """Close what's still open on a listing that is no longer available.
 
-    Booking money with GharSe (Claimed or Paid) is flagged for refund when refund_paid, or
-    — when keep is given — on every request NOT in keep (keep = the booking(s) the place
-    was actually let to). Otherwise a request with money in it is left alone. A confirmed
-    payment becomes Refund due; an unconfirmed claim becomes Refund check, so the team
-    checks whether the money really arrived before refunding anything."""
+    refund_paid is for a listing gone for good (the team removed it): EVERY open request is
+    closed. Booking money with GharSe (Claimed or Paid) is flagged for refund, and a booking
+    the team already released to the owner or paid out is closed with its money state kept,
+    so a released booking is still paid out. Otherwise (the owner let the place) a request
+    with money in it is left alone, except that when keep is given every Claimed or Paid
+    request NOT in keep is flagged for refund (keep = the booking(s) the place was actually
+    let to). A confirmed payment becomes Refund due; an unconfirmed claim becomes Refund
+    check, so the team checks whether the money really arrived before refunding anything.
+    leave_unpaid skips the requests nobody paid on (mark_let closes those afterwards).
+
+    Each request is its own conditional UPDATE, so running this again finishes what an
+    interrupted run left open and changes nothing else (see finish_interrupted)."""
     rows = q("SELECT id, user_id, payment_status FROM rental_requests WHERE rental_id=? AND status IN (?,?)",
              (rental_id, REQUESTED, ACCEPTED))
     title = (q("SELECT title FROM rentals WHERE id=?", (rental_id,)) or [{"title": "the place"}])[0]["title"]
@@ -710,6 +746,16 @@ def _close_open_requests(rental_id, why, refund_paid, keep=None):
                            (CLOSED, to, r["id"], REQUESTED, ACCEPTED, r["payment_status"]))
             extra = " The booking amount you paid will be refunded by the GharSe team."
         elif r["payment_status"] in (PAID_OUT, RELEASED):
+            # Settled with the owner. A tenant of a let place stays; on a removed listing the
+            # booking is closed — nothing is left to act on — and its money stays as it is.
+            if not refund_paid:
+                continue
+            done = execute("UPDATE rental_requests SET status=? WHERE id=? AND status IN (?,?) "
+                           "AND payment_status=? RETURNING id",
+                           (CLOSED, r["id"], REQUESTED, ACCEPTED, r["payment_status"]))
+            extra = (" Your booking amount had already been settled with the owner, so it isn't refunded "
+                     "through GharSe — reply to the GharSe team if you need help.")
+        elif leave_unpaid:
             continue
         else:
             done = execute("UPDATE rental_requests SET status=?, payment_status=NULL WHERE id=? "
@@ -765,7 +811,18 @@ def _is_single_place(r):
 def mark_let(rental_id, uid, let_to=None):
     """Active/Paused → Let. Visit requests nobody paid on are closed. let_to: the request
     ids the place was let to — every OTHER request with booking money is flagged for a
-    refund. None keeps every paid booking (there is at most one, or the owner didn't say)."""
+    refund. None keeps every paid booking (there is at most one, or the owner didn't say).
+
+    Those refunds are made BEFORE the listing turns Let, and the rest is closed after. A
+    write can fail after it has committed, so this can stop between any two statements: the
+    worst it leaves is a place still live with Mark let on the page to finish the job — never
+    a let place with a turned-away guest's money still counted as the owner's payout."""
+    if let_to is not None:
+        if not q("SELECT 1 FROM rentals WHERE id=? AND owner_user_id=? AND status IN (?,?)",
+                 (rental_id, uid, ACTIVE, PAUSED)):
+            return None
+        _close_open_requests(rental_id, "the owner has let it", refund_paid=False, keep=let_to,
+                             leave_unpaid=True)
     if not set_listing_status(rental_id, uid, LET, (ACTIVE, PAUSED)):
         return None
     _close_open_requests(rental_id, "the owner has let it", refund_paid=False, keep=let_to)
@@ -993,7 +1050,10 @@ def _incoming_request(user, uid, rental, x):
                 _contact_block("Guest", guest,
                                f"Hi {guest['first']}, this is about your GharSe visit request for "
                                f"“{rental['title']}”.", key=f"rr_wa{xid}")
-            _owner_money(uid, rental, x, can_ask=standing is None and not blocked and not held)
+            # No booking amount is asked for, changed or cleared while the team has the listing
+            # on hold or has removed it — set_booking_amount refuses it there too.
+            _owner_money(uid, rental, x, can_ask=standing is None and not blocked and not held
+                         and rental["status"] not in (HOLD, REMOVED))
             ps = x["payment_status"]
             if ps not in (PAID_OUT, RELEASED):
                 with st.popover("Cancel this booking"):
@@ -1118,8 +1178,9 @@ def decline_request(request_id, owner_uid):
 
 def set_booking_amount(request_id, owner_uid, amount):
     """Set or change the booking amount while nothing has been paid on it — only by an owner
-    who is verified and not on hold, and on a single place only while nobody else has a
-    booking amount claimed or paid on it."""
+    who is verified and not on hold, only while the listing is live, paused or let (never
+    while the team has it on hold or has removed it), and on a single place only while
+    nobody else has a booking amount claimed or paid on it."""
     s = split_on_top(amount)
     # What it asked for before, for the take-back below: a change that loses the race goes
     # back to the amount the guest was already told about, as if it had never run.
@@ -1130,9 +1191,10 @@ def set_booking_amount(request_id, owner_uid, amount):
         "UPDATE rental_requests SET booking_amount=?, platform_fee=?, ops_fee=?, customer_total=?, "
         f"payment_status=? WHERE id=? AND status=? AND (payment_status IS NULL OR payment_status=?) "
         f"AND {_owner_request_guard()} AND ? IN ({_OWNER_IN_GOOD_STANDING}) "
+        "AND rental_id IN (SELECT id FROM rentals WHERE status IN (?,?,?)) "
         f"AND {_ONE_BOOKING_PER_SINGLE_PLACE} RETURNING id",
         (s["base"], s["platform_fee"], s["ops_fee"], s["customer_total"], UNPAID, request_id, ACCEPTED,
-         UNPAID, owner_uid, owner_uid))
+         UNPAID, owner_uid, owner_uid, ACTIVE, PAUSED, LET))
     # Post-commit re-check: a claim on the same single place that committed while this ran
     # was invisible to the statement above. Take the amount back before the guest is asked
     # to pay a place someone else now holds (only the amount just set, only while unpaid).
@@ -1192,8 +1254,18 @@ def claim_payment(request_id, uid, ref, expected_total):
     listing isn't held or removed, and (for a single place) nobody else has booked it.
 
     Two guests claiming the same single place at once can both get past that last check on
-    Postgres, so once the claim has committed _single_place_backoff runs: if this claim is
-    the one that must give way, it is closed there and None is returned."""
+    Postgres, so once the claim has committed _single_place_backoff runs. Each claimer runs
+    it, and whichever runs first after both have committed closes the claim that must give
+    way — which may be the OTHER guest's, before that guest's own re-check has looked. So
+    the claim is read back afterwards: None is returned when it is no longer held (Refund
+    check — closed by either re-check, or by anything else that called the booking off at
+    that moment), and the request id only for a claim that still stands. A claim the team
+    has confirmed in the meantime still stands.
+
+    What a read-back cannot see is a rival claim still on its way: one whose statement began
+    before this claim committed can commit after the read-back and, as the earlier request,
+    take the place. That guest was told "thanks" truthfully at the time; the back-off then
+    messages her and her card says someone else booked it a moment before her."""
     done = execute(
         "UPDATE rental_requests SET payment_status=?, payment_ref=? WHERE id=? AND user_id=? AND status=? "
         "AND payment_status=? AND ABS(customer_total - ?) < 0.005 "
@@ -1202,24 +1274,32 @@ def claim_payment(request_id, uid, ref, expected_total):
         f" AND r.owner_user_id IN ({_OWNER_IN_GOOD_STANDING})) "
         f"AND {_ONE_BOOKING_PER_SINGLE_PLACE} RETURNING id",
         (CLAIMED, ref, request_id, uid, ACCEPTED, UNPAID, float(expected_total), ACTIVE, PAUSED, LET))
-    if done is not None and done in _single_place_backoff(done):
+    if done is None:
+        return None
+    _single_place_backoff(done)
+    back = q("SELECT payment_status FROM rental_requests WHERE id=?", (done,))
+    if not back or back[0]["payment_status"] == REFUND_CHECK:
         return None
     return done
 
 
 def _single_place_backoff(request_id):
     """The post-commit re-check after a claim, in the spirit of social.py's
-    _over_capacity_void. On the claimed request's place, if it is a single place, every open
-    claim that must give way (_GIVES_WAY) is closed as Refund check — the reference stays,
-    because the guest may well have paid already, so the team matches it and refunds it —
-    and that guest is told. Run by every claimer after its own commit, so whichever claim
-    commits second sees both and the loser is closed; the earliest never is. Returns the
-    ids it closed."""
-    rows = q("SELECT rr.rental_id, r.title FROM rental_requests rr JOIN rentals r ON r.id = rr.rental_id "
-             "WHERE rr.id=?", (request_id,))
-    if not rows:
-        return []
-    rental_id, title = rows[0]["rental_id"], rows[0]["title"]
+    _over_capacity_void: _close_claims_giving_way on the claimed request's place. Run by
+    every claimer after its own commit, so whichever claim commits second sees both and the
+    loser is closed; the earliest never is. Returns the ids it closed."""
+    rows = q("SELECT rental_id FROM rental_requests WHERE id=?", (request_id,))
+    return _close_claims_giving_way(rows[0]["rental_id"]) if rows else []
+
+
+def _close_claims_giving_way(rental_id):
+    """If the place is a single place, every open claim on it that must give way
+    (_GIVES_WAY) is closed as Refund check — the reference stays, because the guest may well
+    have paid already, so the team matches it and refunds it — and that guest is told. Each
+    is one conditional UPDATE, so running it again closes only what is still left. Returns
+    the ids it closed."""
+    rows = q("SELECT title FROM rentals WHERE id=?", (rental_id,))
+    title = rows[0]["title"] if rows else "the place"
     closed = []
     for x in q(f"SELECT id, user_id, payment_ref FROM rental_requests WHERE rental_id=? AND status IN (?,?) "
                f"AND payment_status=? AND {_GIVES_WAY} ORDER BY id", (rental_id, REQUESTED, ACCEPTED, CLAIMED)):
@@ -1232,6 +1312,28 @@ def _single_place_backoff(request_id):
                   "your request is closed. If you've already paid, the GharSe team will match your payment "
                   f"(reference {x['payment_ref'] or '—'}) and refund it in full.", ref=x["id"])
     return closed
+
+
+def _lost_to_rival(request_id):
+    """Closed as Refund check on a single place another open request now holds — the claim
+    gave way in a same-instant race (_close_claims_giving_way)."""
+    return bool(q(f"SELECT 1 FROM rental_requests WHERE id=? AND status=? AND payment_status=? "
+                  f"AND {_HELD_ELSEWHERE}", (request_id, CLOSED, REFUND_CHECK)))
+
+
+def _lost_claim_message(request_id):
+    """What the guest is told when the claim she just made is no longer held (claim_payment
+    returned None and the request is now Refund check): lost to a rival on a single place
+    that someone else now holds, or called off at that very moment. None when the claim
+    simply didn't go through, which the page explains itself."""
+    rows = q("SELECT payment_status FROM rental_requests WHERE id=?", (request_id,))
+    if not rows or rows[0]["payment_status"] != REFUND_CHECK:
+        return None
+    if _lost_to_rival(request_id):
+        return ("Someone else booked this place a moment before you. Your reference is recorded — if "
+                "you've paid, the GharSe team will match it and refund you in full.")
+    return ("This booking was called off just as you paid. Your reference is recorded — if you've paid, "
+            "the GharSe team will match it and refund you in full.")
 
 
 def withdraw_request(request_id, uid):
@@ -1289,9 +1391,13 @@ def _my_request_card(user, uid, x):
             _guest_money(uid, x)
         if ps in (REFUND_CHECK, REFUND_DUE, REFUNDED) and status != ACCEPTED:
             st.markdown(_row_split(x, "guest"), unsafe_allow_html=True)
-            st.caption({REFUND_CHECK: "The GharSe team is matching your payment; once it's found it's "
-                                      "refunded to you.",
-                        REFUND_DUE: "Your refund is on its way from the GharSe team."}.get(ps, "Refunded."))
+            # A claim can lose a same-instant race even after the page said thanks (the rival's
+            # claim commits a moment later), so the card says so itself.
+            lost = ("Someone else booked this place a moment before you. "
+                    if ps == REFUND_CHECK and _lost_to_rival(xid) else "")
+            st.caption(lost + {REFUND_CHECK: "The GharSe team is matching your payment; once it's found it's "
+                                             "refunded to you.",
+                               REFUND_DUE: "Your refund is on its way from the GharSe team."}.get(ps, "Refunded."))
         if status in OPEN_REQUEST and ps not in (PAID_OUT, RELEASED):
             with st.popover("Withdraw request"):
                 st.caption("The owner is told. "
@@ -1305,7 +1411,7 @@ def _my_request_card(user, uid, x):
                               f"{guest['first']} has withdrawn their request for “{x['title']}”.", ref=xid)
                     st.session_state[FLASH] = ("Withdrawn." if done else "That request had already changed.")
                     st.rerun()
-        elif status == ACCEPTED and ps in (PAID_OUT, RELEASED):
+        elif ps in (PAID_OUT, RELEASED) and (status == ACCEPTED or x["rstatus"] == REMOVED):
             st.markdown(safety.grievance_line(), unsafe_allow_html=True)
 
 
@@ -1353,12 +1459,9 @@ def _guest_money(uid, x):
             elif claim_payment(xid, uid, ref, total):
                 st.session_state[FLASH] = "Thanks — the GharSe team will confirm your payment shortly."
                 st.rerun()
-            elif (q("SELECT payment_status FROM rental_requests WHERE id=?", (xid,))
-                  or [{"payment_status": None}])[0]["payment_status"] == REFUND_CHECK:
-                # Lost a same-instant race for a single place (_single_place_backoff).
-                st.session_state[FLASH] = ("Someone else booked this place a moment before you. Your "
-                                           "reference is recorded — if you've paid, the GharSe team will "
-                                           "match it and refund you in full.")
+            elif _lost_claim_message(xid):
+                # Lost a same-instant race for a single place (claim_payment), or called off.
+                st.session_state[FLASH] = _lost_claim_message(xid)
                 st.rerun()
             else:
                 st.error("The booking amount changed or this place isn't taking payments right now — "
@@ -1375,8 +1478,11 @@ def _guest_money(uid, x):
 
 # ----------------------------------------------------------------------------- admin
 def confirm_payment(request_id):
-    return execute("UPDATE rental_requests SET payment_status=? WHERE id=? AND payment_status=? RETURNING id",
-                   (PAID, request_id, CLAIMED))
+    """Claimed → Paid — never for a claim that has to give way on a single place (_GIVES_WAY).
+    Such a claim only exists when the claim's own write failed after committing, so its
+    post-commit re-check never ran; finish_interrupted closes it when Rentals Admin opens."""
+    return execute(f"UPDATE rental_requests SET payment_status=? WHERE id=? AND payment_status=? "
+                   f"AND NOT ({_GIVES_WAY}) RETURNING id", (PAID, request_id, CLAIMED))
 
 
 def reject_payment(request_id):
@@ -1518,9 +1624,16 @@ def record_payout(owner_uid, request_ids, method, ref):
     The payout row is written FIRST, then each booking is flipped by its own conditional
     UPDATE (_PAYABLE_SQL — owner in good standing, listing not held or removed unless the
     team released it — re-checked in the same statement) and added to that row as it flips.
-    So there is never a booking marked paid out without a payout record carrying the team's
-    reference; a second click flips nothing, and a row that ends up empty is deleted.
-    Returns (amount, count) or None."""
+    A second click flips nothing, and a row that ends up empty is deleted. Returns
+    (amount, count) or None.
+
+    A write can fail after it has committed, so this can stop between any two statements.
+    Stopped after the row: an empty row, deleted later by _complete_payout_records. Stopped
+    after a flip, before the row counts it: the booking is paid out but the owner's records
+    are short by it, and _complete_payout_records adds it to her latest row. Stopped after
+    counting: the bookings not reached are still Paid and still owed, and Owner payouts warns
+    that a payout to that owner was just recorded. So a booking is never paid out without a
+    record of it, and never recorded twice."""
     payout_id = execute("INSERT INTO social_payouts (user_id, amount, items_count, source, method, ref, "
                         "created_at) VALUES (?,?,?,?,?,?,?)",
                         (owner_uid, 0, 0, "rental", method, ref, now_iso()))
@@ -1545,6 +1658,91 @@ def record_payout(owner_uid, request_ids, method, ref):
           f"{_money(total)} has been sent to you for {count} room booking{'s' if count != 1 else ''} on "
           f"GharSe. {method} reference {ref}.")
     return total, count
+
+
+# A payout row younger than this may belong to a record_payout still running, so
+# _complete_payout_records leaves its owner alone until then — far longer than recording
+# a payout ever takes.
+_PAYOUT_SETTLE = timedelta(minutes=10)
+
+
+def _settle_cutoff():
+    return (now_ist() - _PAYOUT_SETTLE).isoformat(timespec="seconds")
+
+
+# For _complete_payout_records, on the owner's latest rental payout row: set it so that her
+# payout rows add up to her Paid out bookings — amount and count read from the bookings and
+# her OTHER rows, so running it twice changes nothing — only while it is her latest row,
+# older than the cutoff, and her rows are short.
+_COMPLETE_PAYOUT_SQL = (
+    "UPDATE social_payouts SET "
+    "amount = (SELECT COALESCE(SUM(rr.booking_amount),0) FROM rental_requests rr JOIN rentals r "
+    " ON r.id = rr.rental_id WHERE r.owner_user_id=? AND rr.payment_status='Paid out') "
+    " - (SELECT COALESCE(SUM(x.amount),0) FROM social_payouts x WHERE x.user_id=? AND x.source='rental' "
+    " AND x.id <> social_payouts.id), "
+    "items_count = (SELECT COUNT(*) FROM rental_requests rr JOIN rentals r ON r.id = rr.rental_id "
+    " WHERE r.owner_user_id=? AND rr.payment_status='Paid out') "
+    " - (SELECT COALESCE(SUM(x.items_count),0) FROM social_payouts x WHERE x.user_id=? AND x.source='rental' "
+    " AND x.id <> social_payouts.id) "
+    "WHERE id = (SELECT MAX(y.id) FROM social_payouts y WHERE y.user_id=? AND y.source='rental') "
+    "AND created_at < ? "
+    "AND (SELECT COALESCE(SUM(rr.booking_amount),0) FROM rental_requests rr JOIN rentals r "
+    " ON r.id = rr.rental_id WHERE r.owner_user_id=? AND rr.payment_status='Paid out') "
+    " - (SELECT COALESCE(SUM(x.amount),0) FROM social_payouts x WHERE x.user_id=? AND x.source='rental') "
+    " > 0.005 RETURNING id")
+
+
+def _complete_payout_records():
+    """Every booking marked Paid out is in its owner's payout records. A record_payout that
+    stopped after flipping a booking but before counting it leaves her bookings worth more
+    than her records; the difference goes onto her latest payout row — the one that stopped,
+    in practice — once that row is older than _PAYOUT_SETTLE, so a recording still running
+    is never counted twice. Rows a stopped recording left empty are deleted, on the same
+    terms. Returns the owners whose records it completed."""
+    cutoff = _settle_cutoff()
+    flipped = {r["uid"]: _num(r["s"]) for r in q(
+        "SELECT r.owner_user_id uid, SUM(rr.booking_amount) s FROM rental_requests rr JOIN rentals r "
+        "ON r.id = rr.rental_id WHERE rr.payment_status=? GROUP BY r.owner_user_id", (PAID_OUT,))}
+    recorded = {r["user_id"]: _num(r["s"]) for r in q(
+        "SELECT user_id, SUM(amount) s FROM social_payouts WHERE source='rental' GROUP BY user_id")}
+    done = []
+    for uid, s in flipped.items():
+        if s - recorded.get(uid, 0.0) > 0.005 and execute(
+                _COMPLETE_PAYOUT_SQL, (uid, uid, uid, uid, uid, cutoff, uid, uid)):
+            done.append(uid)
+    # Read first: this runs on every Rentals Admin render, and there only a write can raise on
+    # a dropped connection (a read is retried).
+    if q("SELECT 1 FROM social_payouts WHERE source='rental' AND items_count=0 AND ABS(amount) < 0.005 "
+         "AND created_at < ? LIMIT 1", (cutoff,)):
+        execute("DELETE FROM social_payouts WHERE source='rental' AND items_count=0 AND ABS(amount) < 0.005 "
+                "AND created_at < ?", (cutoff,))
+    return done
+
+
+def _finish_removals():
+    """A removal stopped part-way through closing the listing's requests (a write can fail
+    after committing) leaves some open on a listing that is gone; close them now."""
+    for r in q("SELECT DISTINCT rr.rental_id FROM rental_requests rr JOIN rentals r ON r.id = rr.rental_id "
+               "WHERE r.status=? AND rr.status IN (?,?) "
+               "AND (rr.payment_status IS NULL OR rr.payment_status IN (?,?,?,?,?))",
+               (REMOVED, REQUESTED, ACCEPTED, UNPAID, CLAIMED, PAID, RELEASED, PAID_OUT)):
+        _close_open_requests(r["rental_id"], "it was taken down", refund_paid=True)
+
+
+def finish_interrupted():
+    """Finish what a stopped change left half done. store.py sends a Postgres write once and
+    raises if the connection drops, and the write may have committed, so a change made of
+    several statements can stop between any two of them; each of these repairs is safe to
+    run any number of times, and Rentals Admin runs them whenever it opens:
+      * a claim whose post-commit re-check never ran, on a single place someone else holds,
+        is closed as Refund check (and confirm_payment refuses it meanwhile);
+      * requests a removal left open on a removed listing are closed;
+      * bookings paid out but missing from the owner's payout records are added to them."""
+    for r in q(f"SELECT DISTINCT rental_id FROM rental_requests WHERE status IN (?,?) AND payment_status=? "
+               f"AND {_GIVES_WAY}", (REQUESTED, ACCEPTED, CLAIMED)):
+        _close_claims_giving_way(r["rental_id"])
+    _finish_removals()
+    _complete_payout_records()
 
 
 # The team can hold a listing that is live, paused by its owner, or LET — Let is where
@@ -1594,10 +1792,10 @@ def moderate_listing(rental_id, action, reason):
               f"Your listing “{r['title']}” is on hold and hidden from Rooms & PGs. Reason: {reason}. "
               "Edit the listing to fix it and reply to the GharSe team to have it restored.", ref=rental_id)
     elif action == "remove":
+        # The owner is told before the requests are closed: if closing stops part-way,
+        # finish_interrupted closes the rest, but nothing would tell her afterwards.
+        _tell(r["owner_user_id"], _MOD_KINDS[1], _removal_message(rental_id, r["title"], reason), ref=rental_id)
         _close_open_requests(rental_id, "it was taken down", refund_paid=True)
-        _tell(r["owner_user_id"], _MOD_KINDS[1],
-              f"Your listing “{r['title']}” has been removed from Rooms & PGs. Reason: {reason}. Open "
-              "requests on it were closed and any booking money is being refunded to guests.", ref=rental_id)
     else:
         _tell(r["owner_user_id"], "Room listing restored",
               {ACTIVE: f"Your listing “{r['title']}” is live on Rooms & PGs again.",
@@ -1609,12 +1807,31 @@ def moderate_listing(rental_id, action, reason):
     return done
 
 
+def _removal_message(rental_id, title, reason):
+    """What the owner is told when the team removes her listing — read before its requests
+    are closed. It promises a refund only for money GharSe still holds on an open request;
+    a booking the team already released to her or paid out is not refunded by the removal,
+    and a paid stay that has already ended waits for the team."""
+    rows = q("SELECT status, payment_status FROM rental_requests WHERE rental_id=?", (rental_id,))
+    refunding = any(x["status"] in OPEN_REQUEST and x["payment_status"] in (CLAIMED, PAID) for x in rows)
+    held = any(x["status"] not in OPEN_REQUEST and x["payment_status"] == PAID for x in rows)
+    settled = any(x["payment_status"] in (RELEASED, PAID_OUT) for x in rows)
+    return (f"Your listing “{title}” has been removed from Rooms & PGs. Reason: {reason}. Open requests on "
+            "it were closed"
+            + (", and booking amounts guests paid on them are being refunded to them." if refunding else ".")
+            + (" Booking amounts from stays that have already ended are held while the GharSe team looks "
+               "into it." if held else "")
+            + (" Booking amounts the GharSe team had already released to you or paid out are not refunded "
+               "by this." if settled else ""))
+
+
 def rentals_admin(admin_user):
     # This page shows exact addresses, phones, UPI IDs and payment references and moves
     # money, so it guards itself rather than relying on the app's routing alone.
     if (admin_user or {}).get("role") != "admin":
         st.error("Only the GharSe team can open this page.")
         return
+    finish_interrupted()
     st.markdown(
         f"<div class='page-title'>{h(ADMIN_PAGE_TITLE)}</div>"
         "<div class='page-sub'>Rooms & PGs: confirm booking payments, pay owners what they're owed, "
@@ -1675,6 +1892,10 @@ def _admin_payments(claims):
                               f"Your payment of {_money(x['customer_total'])} for “{x['title']}” is "
                               "confirmed. It's booked.", ref=x["id"])
                         st.session_state[ADMIN_FLASH] = f"Confirmed payment on request #{x['id']}."
+                    else:
+                        st.session_state[ADMIN_FLASH] = (
+                            "warn", (f"Request #{x['id']} wasn't confirmed — it changed, or someone else "
+                                     "holds this place. Check it below before doing anything else."))
                     st.rerun()
                 if b[1].button("Not received", key=f"ra_rej{x['id']}", width="stretch"):
                     if reject_payment(x["id"]):
@@ -1720,6 +1941,11 @@ def _admin_payouts(due, frozen=None):
         st.success("Nothing owed — every paid booking has been settled with its owner.")
     elif not due:
         st.info("Nothing can be paid out right now — the paid bookings below are frozen.")
+    # Each owner's latest payout, to warn when one was recorded minutes ago: a recording that
+    # stopped part-way leaves the bookings it didn't reach still owed, money already sent.
+    latest = {r["user_id"]: dict(r) for r in q(
+        "SELECT user_id, amount, ref, created_at FROM social_payouts WHERE source='rental' AND id IN "
+        "(SELECT MAX(id) FROM social_payouts WHERE source='rental' GROUP BY user_id)")} if due else {}
     for owner_uid, items in due.items():
         owner = _contact(owner_uid)
         amount = round(sum(a for _, a in items), 2)
@@ -1733,6 +1959,12 @@ def _admin_payouts(due, frozen=None):
                           unsafe_allow_html=True)
             if not owner["upi"]:
                 st.caption("No UPI ID on file — ask the owner for one before paying.")
+            last = latest.get(owner_uid)
+            if last and (last["created_at"] or "") >= _settle_cutoff():
+                st.warning(f"A payout to this owner was recorded at {h(short_dt(last['created_at']))} "
+                           f"(reference {h(last['ref'] or '—')}, {_money(last['amount'])} recorded). If that "
+                           "payment was meant to cover these bookings too, don't send the money again — "
+                           "record them with the same reference.")
             with st.form(f"ra_po{owner_uid}", border=False):
                 fc = st.columns([1, 2, 1])
                 method = fc[0].selectbox("Method", ["UPI", "Bank transfer", "Cash"], key=f"ra_pom{owner_uid}")
@@ -1744,9 +1976,20 @@ def _admin_payouts(due, frozen=None):
                     st.error("Enter the transaction reference — it's the audit trail.")
                 else:
                     res = record_payout(owner_uid, [i for i, _ in items], method, ref)
-                    st.session_state[ADMIN_FLASH] = (
-                        f"Recorded {_money(res[0])} to {h(owner['name'])}." if res else
-                        "Those bookings were already paid out.")
+                    # Bookings can change between drawing the page and the click (paid out from
+                    # another tab, refunded, frozen): say what was recorded, never guess why not.
+                    if res is None:
+                        st.session_state[ADMIN_FLASH] = (
+                            "warn", ("Nothing recorded — those bookings changed: paid out, refunded or frozen. "
+                                     "Check before sending money."))
+                    elif res[1] < len(items):
+                        st.session_state[ADMIN_FLASH] = (
+                            "warn", (f"Recorded {_money(res[0])} to {h(owner['name'])}, not the "
+                                     f"{_money(amount)} on the button — {len(items) - res[1]} of the "
+                                     f"{len(items)} bookings changed: paid out, refunded or frozen. Check "
+                                     "before sending money."))
+                    else:
+                        st.session_state[ADMIN_FLASH] = f"Recorded {_money(res[0])} to {h(owner['name'])}."
                     st.rerun()
     by_owner = {}
     for r in frozen or []:
