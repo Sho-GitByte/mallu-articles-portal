@@ -1,6 +1,6 @@
 """Smoke test: render every page of the GharSe app for every role, with real data."""
 import os, re, sys, tempfile, importlib.util
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(ROOT, "app.py")
@@ -13,7 +13,11 @@ hea = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hea)
 hea.init_db()
 
-now = datetime.utcnow().isoformat()
+# India time, as the app keeps it: listings dated by the server's UTC day vanish from
+# "today" between 18:30 and midnight UTC, when it is already tomorrow in Bengaluru.
+import store
+now = store.now_iso()
+today = store.today_ist()
 pid = hea.execute(
     "INSERT INTO providers (display_name, owner_name, phone, area, kinds, categories, cuisines, languages, "
     "diet, fssai_no, kyc_done, hygiene_done, verified, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,1,1,?)",
@@ -31,7 +35,7 @@ lid = hea.execute(
     "INSERT INTO listings (provider_id, kind, category, title, description, cuisine, diet, price, unit, "
     "market_price, avail_date, slot, capacity, sold, active, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,1,?)",
     (pid, "Food", "Daily Meal (Veg)", "Rice · Sambar · Rasam · Poriyal · Curd", "Full South Indian meal",
-     "South Indian", "Vegetarian", 85, "per meal", 160, date.today().isoformat(), hea.SLOTS[1], 20, now))
+     "South Indian", "Vegetarian", 85, "per meal", 160, today.isoformat(), hea.SLOTS[1], 20, now))
 plid = hea.execute(
     "INSERT INTO plans (provider_id, title, description, slot, days, price, diet, active, created_at) "
     "VALUES (?,?,?,?,?,?,?,1,?)", (pid, "PG Lunch Plan", "Lunch, 26 days", hea.SLOTS[1], 26, 2600, "Vegetarian", now))
@@ -53,7 +57,7 @@ hea.execute("UPDATE listings SET photo=? WHERE id=?", (small, lid))
 hea.execute("UPDATE providers SET photo=? WHERE id=?", (small, pid))
 hea.execute("UPDATE providers SET fssai_status='registered', fssai_kind='basic', fssai_verified=1, "
             "fssai_cert=?, fssai_cert_mime='image/jpeg', fssai_expiry=? WHERE id=?",
-            (small, (date.today() + timedelta(days=365)).isoformat(), pid))
+            (small, (today + timedelta(days=365)).isoformat(), pid))
 assert hea.can_sell_food(dict(hea.q("SELECT * FROM providers WHERE id=?", (pid,))[0])), "seeded kitchen must sell food"
 print(f"photo pipeline ... ok  {len(raw) // 1024}KB PNG -> {len(small) // 1024}KB JPEG")
 
@@ -67,15 +71,15 @@ oid = hea.execute(
     "ops_fee, provider_payout, customer_total, delivery_mode, note, status, for_date, slot, created_at) "
     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'Delivered', ?,?,?)",
     (lid, pid, cid, 2, s["item_total"], s["delivery_fee"], s["platform_fee"], s["ops_fee"], s["provider_payout"],
-     s["customer_total"], "Community pickup point", "less oil", date.today().isoformat(), hea.SLOTS[1], now))
+     s["customer_total"], "Community pickup point", "less oil", today.isoformat(), hea.SLOTS[1], now))
 hea.execute("UPDATE listings SET sold=2 WHERE id=?", (lid,))
 hea.execute("INSERT INTO subscriptions (plan_id, provider_id, customer_id, start_date, days, price, delivery_mode, "
             "prefs, paused, status, created_at) VALUES (?,?,?,?,?,?,?,?,0,'Active',?)",
-            (plid, pid, cid, date.today().isoformat(), 26, 2600, "Community pickup point", "Veg · Medium", now))
+            (plid, pid, cid, today.isoformat(), 26, 2600, "Community pickup point", "Veg · Medium", now))
 rid = hea.execute("INSERT INTO requests (customer_id, kind, category, title, description, area, budget, needed_by, "
                   "status, created_at) VALUES (?,?,?,?,?,?,?,?, 'Open', ?)",
                   (cid, "Product", "Flowers & Garlands", "50 jasmine garlands", "For a wedding", "HSR Layout",
-                   2000, (date.today() + timedelta(days=2)).isoformat(), now))
+                   2000, (today + timedelta(days=2)).isoformat(), now))
 hea.execute("INSERT INTO bids (request_id, provider_id, price, eta, note, status, created_at) "
             "VALUES (?,?,?,?,?, 'Offered', ?)", (rid, pid, 1800, "tomorrow 6 AM", "fresh from market", now))
 
@@ -116,6 +120,38 @@ ist = store.now_ist()
 assert ist.utcoffset().total_seconds() == 19800, ist.utcoffset()
 assert store.today_ist() == ist.date()
 print("store ............ ok  pbkdf2 + legacy upgrade + IST")
+
+# A Postgres write is sent once: with autocommit it may have committed before the
+# connection dropped, so running it again would insert twice. Reads are retried.
+# Checked against a stand-in connection, since CI has no Postgres.
+import psycopg2
+
+class _Cur:
+    description = None
+    def __init__(self, log): self.log = log
+    def execute(self, sql, params=()):
+        self.log.append(sql)
+        raise psycopg2.OperationalError("server closed the connection unexpectedly")
+    def close(self): pass
+
+class _Conn:
+    def __init__(self, log): self.log = log
+    def cursor(self): return _Cur(self.log)
+    def close(self): pass
+
+sent, saved = [], (store.KIND, store._connect)
+store._reset(); store.KIND, store._connect = "postgres", lambda: _Conn(sent)
+store._last_used = __import__("time").monotonic()            # recently used: no probe
+for fn, sql in ((store.execute, "INSERT INTO blocks (user_id) VALUES (?)"), (store.q, "SELECT 1")):
+    sent.clear()
+    try:
+        fn(sql)
+    except psycopg2.OperationalError:
+        pass
+    assert len(sent) == (1 if fn is store.execute else 2), (sql, sent)
+store._reset(); store.KIND, store._connect = saved
+assert store.q("SELECT 1 AS one")[0]["one"] == 1
+print("store retry ...... ok  a Postgres write is never sent twice, a read is retried once")
 
 # app.py must not talk to a driver itself any more
 src = open(APP, encoding="utf-8").read()

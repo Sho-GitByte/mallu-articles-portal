@@ -16,6 +16,7 @@ import re
 import secrets as _secrets
 import sqlite3
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 SQLITE_PATH = os.environ.get("GHARSE_DB_PATH", "gharse.db")
@@ -91,6 +92,10 @@ def now_iso():
 # ----------------------------------------------------------------------------- connection
 _lock = threading.Lock()
 _conn = None
+_last_used = 0.0
+# A Postgres connection idle longer than this is checked with SELECT 1 before a write
+# is sent on it (see _run).
+IDLE_PROBE_SECONDS = 30
 _ready = False
 
 def _connect():
@@ -131,17 +136,52 @@ def _translate(sql):
         return sql
     return sql.replace("%", "%%").replace("?", "%s")
 
+def _connection_lost(exc):
+    """True for a dropped or unusable connection, as opposed to an error in the SQL."""
+    if KIND != "postgres":
+        return isinstance(exc, sqlite3.OperationalError)
+    import psycopg2
+    return isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError))
+
+def _probe(conn):
+    """Make sure a Postgres connection that has sat idle still answers, before a write
+    is sent on it. Nothing has been written yet, so a failure here is safe to retry."""
+    if KIND != "postgres" or time.monotonic() - _last_used < IDLE_PROBE_SECONDS:
+        return conn
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return conn
+    except Exception as e:
+        if not _connection_lost(e):
+            raise
+        _reset()
+        return connect()
+
 def _run(sql, params, want_rows):
+    """Run one statement. A read is retried once after a dropped connection. A write
+    on Postgres is NOT: with autocommit it may have committed before the connection
+    went, and running it again would insert a second row or make a guarded UPDATE
+    report a change it made itself as already taken. So a write is sent once, on a
+    connection checked first if it has been idle, and a failure is raised to the
+    page rather than guessed at. SQLite never keeps a failed statement, so a write
+    there may be retried like a read."""
+    global _last_used
     stmt = _translate(sql)
+    retry_safe = want_rows or KIND != "postgres"
     with _lock:
         for attempt in (1, 2):
             try:
                 conn = connect()
+                if not want_rows:
+                    conn = _probe(conn)
                 cur = conn.cursor()
                 cur.execute(stmt, tuple(params))
                 if want_rows:
                     rows = cur.fetchall()
                     cur.close()
+                    _last_used = time.monotonic()
                     return rows
                 out = None
                 if cur.description is not None:          # RETURNING id
@@ -153,12 +193,14 @@ def _run(sql, params, want_rows):
                 cur.close()
                 if KIND == "sqlite":
                     conn.commit()
+                _last_used = time.monotonic()
                 return out
-            except Exception:
-                # A dropped connection to a sleeping Postgres is ordinary; retry once.
-                if attempt == 2:
+            except Exception as e:
+                lost = _connection_lost(e)
+                if lost:
+                    _reset()
+                if attempt == 2 or not lost or not retry_safe:
                     raise
-                _reset()
 
 def q(sql, params=()):
     """SELECT. Rows are mapping-like in both dialects: row["column"] works."""
