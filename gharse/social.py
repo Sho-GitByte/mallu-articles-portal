@@ -18,9 +18,16 @@
 #                capacity (that second check is what makes it safe on Postgres, where two
 #                concurrent INSERT … SELECTs can read the same count). The last booking to
 #                commit always sees every other one, so capacity can never be exceeded.
-#   * claim / confirm / reject / refund / cancel — UPDATE … WHERE <expected state>.
+#   * claim / confirm / reject / re-open / refund / cancel — UPDATE … WHERE <expected state>.
+#                Every move to "Claimed" (a claim, a lapsed hold taken back, a re-open)
+#                stamps claimed_at in that same UPDATE, and the team's "Waiting …" flag
+#                counts from it; rows from before the column count from created_at.
 #   * payout   — INSERT … SELECT … WHERE amount <= (earned − already paid), then the same
 #                post-commit re-check, so a host can never be paid twice.
+#
+# One account can hold only so many PAID seats on an event while its payment is being
+# checked: the admin's "social_seat_cap" setting (Fees & Settings), read through
+# paid_seat_cap() by the INSERT, the lapsed-hold re-take and the seat picker alike.
 #
 # How a cancelled booking records its refund (the schema has no refund column yet):
 # customer_total stays what the guest paid; ticket_total / platform_fee / ops_fee /
@@ -30,6 +37,13 @@
 # calls the event off after such a guest was partly refunded, the rest goes back on its own
 # row (qty 0, status "Event cancelled", payment_status "Refund due", customer_total = the
 # remainder), so the original row still reads exactly what was refunded the first time.
+# The same happens when the team had already SENT the part refund but not yet marked it
+# when the event was called off (which turns that row into a full refund): "I already sent
+# ₹X" records X as refunded on the original row and queues the rest on its own row
+# (record_part_refund). Either way, once its rest has its own row the original's kept part
+# sits in ticket_total alone — host_payout and both fees 0, since nobody keeps anything of
+# a cancelled event — and the rest is queued only by the one conditional UPDATE that moves
+# the original into that shape, so it can never be queued twice.
 #
 # Payment references are 12-digit UPI UTRs, and a reference can be on one booking only. A
 # claim the team rejects is final for that booking: the seats are released and the
@@ -71,11 +85,6 @@ KIND_CAPS = {"House party": 50, "Trip": 40, "Hangout": 30, "Friends meet": 100, 
 ADULT_KINDS = {"House party", "Trip"}          # identity-verified guests only, 18+
 ADULT_AGE = 18
 MAX_SEATS_PER_BOOKING = 10
-# Seats one account may hold on one event while its payment is unconfirmed (Unpaid or
-# Claimed). Any 12-digit number passes as a UTR until the team checks it, so without a cap
-# one phone-verified account could keep a small paid event "Sold out" with a made-up
-# reference. Free seats are confirmed at once and only need MAX_SEATS_PER_BOOKING.
-MAX_UNCONFIRMED_SEATS = 4
 CLAIM_SLA_HOURS = 2                            # admin sees a claim older than this flagged
 HOLD_MINUTES = 60                              # unpaid seats are held this long, then released
 MAX_EVENT_DAYS = 14
@@ -311,9 +320,25 @@ def _over_capacity_void(booking_id, event_id):
         (booking_id, ACTIVE, event_id, ACTIVE, event_id, event_id)) is not None
 
 
+def paid_seat_cap():
+    """Paid seats one account may hold on one event while its payment is unconfirmed (Unpaid
+    or Claimed). Any 12-digit number passes as a UTR until the team checks it, so without a
+    cap one phone-verified account could keep a small paid event "Sold out" with a made-up
+    reference. The number is the admin's (Fees & Settings), kept within
+    1..MAX_SEATS_PER_BOOKING, and every check that needs it — the INSERT, the lapsed-hold
+    re-take, the seat picker — reads it here, so they can't disagree. Free seats are
+    confirmed at once and only need MAX_SEATS_PER_BOOKING."""
+    return max(1, min(MAX_SEATS_PER_BOOKING, setting("social_seat_cap", int)))
+
+
+def _cap_msg(cap):
+    return (f"One account can hold up to {cap} paid seat{'s' if cap != 1 else ''} for an event while the "
+            "payment is being checked. Choose fewer.")
+
+
 def seat_limit(event):
     """Most seats one account can take on this event in one booking."""
-    return MAX_SEATS_PER_BOOKING if not (event["ticket_price"] or 0) > 0 else MAX_UNCONFIRMED_SEATS
+    return MAX_SEATS_PER_BOOKING if not (event["ticket_price"] or 0) > 0 else paid_seat_cap()
 
 
 def had_rejected(event_id, user_id):
@@ -351,9 +376,9 @@ def reserve(event, user_id, qty):
         return None, f"Verify your phone number under {kyc.KYC_PAGE_TITLE} before booking."
     s = split_on_top((event["ticket_price"] or 0) * qty)
     free = s["customer_total"] <= 0
-    if not free and qty > MAX_UNCONFIRMED_SEATS:
-        return None, (f"One account can hold up to {MAX_UNCONFIRMED_SEATS} paid seats for an event while the "
-                      "payment is being checked. Choose fewer.")
+    cap = paid_seat_cap()                      # read once: the check, the INSERT and the message agree
+    if not free and qty > cap:
+        return None, _cap_msg(cap)
     if had_rejected(event["id"], user_id):
         return None, REJECTED_MSG
     now = _now_iso()
@@ -368,22 +393,21 @@ def reserve(event, user_id, qty):
         "WHERE b.event_id=e.id AND b.status=?) "
         "AND NOT EXISTS (SELECT 1 FROM event_bookings b2 WHERE b2.event_id=e.id AND b2.user_id=? "
         "AND (b2.status=? OR b2.payment_status='Rejected')) "
-        # A paid hold is unconfirmed until the team checks the UTR: at most
-        # MAX_UNCONFIRMED_SEATS for one account (the price is the event's own, read here).
+        # A paid hold is unconfirmed until the team checks the UTR: at most paid_seat_cap()
+        # seats for one account (the price is the event's own, read here).
         "AND (COALESCE(e.ticket_price,0) <= 0 OR CAST(? AS INTEGER) <= CAST(? AS INTEGER)) RETURNING id",
         (event["id"], user_id, qty, s["base"], s["platform_fee"], s["ops_fee"], s["customer_total"],
          s["host_payout"], "Paid" if free else "Unpaid", ACTIVE, now,
-         event["id"], now, user_id, user_id, qty, ACTIVE, user_id, ACTIVE, qty, MAX_UNCONFIRMED_SEATS))
+         event["id"], now, user_id, user_id, qty, ACTIVE, user_id, ACTIVE, qty, cap))
     if bid is None:
         if had_rejected(event["id"], user_id):
             return None, REJECTED_MSG
         if q("SELECT 1 FROM event_bookings WHERE event_id=? AND user_id=? AND status=?",
              (event["id"], user_id, ACTIVE)):
             return None, "You already have seats for this event — see My bookings."
-        if qty > MAX_UNCONFIRMED_SEATS and float((q("SELECT ticket_price FROM events WHERE id=?", (event["id"],))
-                                                  or [{"ticket_price": 0}])[0]["ticket_price"] or 0) > 0:
-            return None, (f"One account can hold up to {MAX_UNCONFIRMED_SEATS} paid seats for an event while "
-                          "the payment is being checked. Choose fewer.")
+        if qty > cap and float((q("SELECT ticket_price FROM events WHERE id=?", (event["id"],))
+                                or [{"ticket_price": 0}])[0]["ticket_price"] or 0) > 0:
+            return None, _cap_msg(cap)
         left = max(0, int(event["capacity"] or 0) - seats_taken(event["id"]))
         if left <= 0:
             return None, "Sorry — it just sold out."
@@ -420,42 +444,43 @@ def claim(booking, user_id, ref):
     seats are still free; if not, the reference is still recorded so the team can refund
     money that was already sent. Only an Unpaid booking can be claimed, so once the team
     rejects a claim ("Rejected") the guest can't simply type another number into it.
+    Every UPDATE here stamps claimed_at, so the team's wait counts from the claim itself.
     Returns (ok, message)."""
     bad = utr_problem(ref, booking["id"])
     if bad:
         return False, bad
     ref = clean_utr(ref)
+    now = _now_iso()
     if booking["status"] == ACTIVE:
-        ok = execute("UPDATE event_bookings SET payment_status='Claimed', payment_ref=? "
+        ok = execute("UPDATE event_bookings SET payment_status='Claimed', payment_ref=?, claimed_at=? "
                      "WHERE id=? AND user_id=? AND status=? AND payment_status='Unpaid' " + _REF_FREE
-                     + "RETURNING id", (ref, booking["id"], user_id, ACTIVE, ref, booking["id"]))
+                     + "RETURNING id", (ref, now, booking["id"], user_id, ACTIVE, ref, booking["id"]))
         if ok is None:
             return False, "This booking has changed — refresh and check its status."
         return True, "Thanks — the GharSe team will confirm your payment shortly."
     if booking["status"] == "Expired":
-        now = _now_iso()
         # The seats come back only within the same account rules as a new booking: no other
-        # live booking or rejected claim on this event, and no more than the unconfirmed cap.
+        # live booking or rejected claim on this event, and no more than the paid-seat cap.
         back = execute(
-            "UPDATE event_bookings SET status=?, payment_status='Claimed', payment_ref=? "
+            "UPDATE event_bookings SET status=?, payment_status='Claimed', payment_ref=?, claimed_at=? "
             "WHERE id=? AND user_id=? AND status='Expired' AND payment_status='Unpaid' " + _REF_FREE
             + "AND qty <= ? AND " + _ACCOUNT_FREE + " "
             "AND (SELECT e.capacity FROM events e WHERE e.id=? AND e.status='Published' AND e.starts_at > ?) "
             ">= qty + (SELECT COALESCE(SUM(b2.qty),0) FROM event_bookings b2 WHERE b2.event_id=? "
             "AND b2.status=?) RETURNING id",
-            (ACTIVE, ref, booking["id"], user_id, ref, booking["id"], MAX_UNCONFIRMED_SEATS,
+            (ACTIVE, ref, now, booking["id"], user_id, ref, booking["id"], paid_seat_cap(),
              booking["event_id"], user_id, booking["id"], ACTIVE, booking["event_id"], now,
              booking["event_id"], ACTIVE))
         if (back is not None and not _account_conflict_void(back, booking["event_id"], user_id)
                 and not _over_capacity_void(back, booking["event_id"])):
             return True, "Your seats were still free — they're yours again. The team will confirm your payment."
-        kept = execute("UPDATE event_bookings SET payment_status='Claimed', payment_ref=? "
+        kept = execute("UPDATE event_bookings SET payment_status='Claimed', payment_ref=?, claimed_at=? "
                        "WHERE id=? AND user_id=? AND payment_status='Unpaid' " + _REF_FREE + "RETURNING id",
-                       (ref, booking["id"], user_id, ref, booking["id"]))
+                       (ref, now, booking["id"], user_id, ref, booking["id"]))
         if back is None and kept is None:
             return False, "This booking has changed — refresh and check its status."
-        return True, ("Your hold had lapsed and the seats have gone, so this can't be a booking — but "
-                      "your reference is recorded and the team will refund the full amount once they've "
+        return True, ("Your hold had lapsed and the seats couldn't be given back, so this can't be a booking — "
+                      "but your reference is recorded and the team will refund the full amount once they've "
                       "matched the payment.")
     return False, "This booking can't take a payment now."
 
@@ -507,13 +532,20 @@ def cancel_event(event_id, reason, by):
             "WHERE event_id=? AND status='Cancelled' AND payment_status IN ('Paid','Refund due','Claimed','Rejected') "
             "AND customer_total > 0", (event_id,))
     # 3. Guests who cancelled earlier and were already refunded part of it: the part their
-    #    rule kept now comes back too, on its own row. The original row keeps its figures, so
-    #    it still shows exactly what the first refund was; host earnings and GharSe's fees
-    #    leave out cancelled events, so the kept figures on it count for nobody.
+    #    rule kept now comes back too, on its own row. The original row still owes nothing
+    #    more and still shows exactly what the first refund was; its kept part moves to
+    #    ticket_total alone (nobody keeps anything of a cancelled event), and that move is
+    #    the conditional UPDATE which lets this call queue the rest — a row already in that
+    #    shape (say record_part_refund got there first) already has its rest queued.
     for b in [dict(r) for r in q("SELECT * FROM event_bookings WHERE event_id=? AND status='Cancelled' "
                                  "AND payment_status='Refunded' AND customer_total > 0", (event_id,))]:
         rest = kept_total(b)
-        if rest > 0.005:
+        if rest > 0.005 and execute(
+                "UPDATE event_bookings SET ticket_total=?, platform_fee=0, ops_fee=0, host_payout=0 "
+                "WHERE id=? AND status='Cancelled' AND payment_status='Refunded' "
+                "AND ABS(COALESCE(ticket_total,0) + COALESCE(platform_fee,0) + COALESCE(ops_fee,0) - ?) < 0.005 "
+                "AND COALESCE(host_payout,0) + COALESCE(platform_fee,0) + COALESCE(ops_fee,0) > 0.005 "
+                "RETURNING id", (rest, b["id"], rest)) is not None:
             execute("INSERT INTO event_bookings (event_id, user_id, qty, ticket_total, platform_fee, ops_fee, "
                     "customer_total, host_payout, payment_status, payment_ref, status, created_at) "
                     "VALUES (?,?,0,0,0,0,?,0,'Refund due',?,'Event cancelled',?)",
@@ -617,9 +649,9 @@ def reject_payment(booking_id):
 
 def reopen_payment(booking_id):
     """The money turned up after a rejection: back to Claimed, so confirm_payment decides
-    (a released booking goes straight to refunds)."""
-    return execute("UPDATE event_bookings SET payment_status='Claimed' WHERE id=? AND payment_status='Rejected' "
-                   "RETURNING id", (booking_id,)) is not None
+    (a released booking goes straight to refunds). The wait starts again from now."""
+    return execute("UPDATE event_bookings SET payment_status='Claimed', claimed_at=? WHERE id=? "
+                   "AND payment_status='Rejected' RETURNING id", (_now_iso(), booking_id)) is not None
 
 
 def mark_refunded(booking_id, amount):
@@ -640,6 +672,55 @@ def mark_refunded(booking_id, amount):
     _tell(b["user_id"], "guest", "refund sent",
           f"Your refund of {rs(refund_of(b))} for your GharSe event booking has been sent.", booking_id)
     return True
+
+
+def part_refund_applies(b, ev_status):
+    """A guest's own cancellation, on an event since called off, now owing everything that
+    was paid. A refund the team has already seen can only grow into this shape (cancel_event
+    step 2 makes a part refund a full one), so it is where record_part_refund is offered."""
+    owed = refund_of(b)
+    return (b["status"] == "Cancelled" and b["payment_status"] == "Refund due" and ev_status == "Cancelled"
+            and owed > 0.005 and abs(owed - float(b["customer_total"] or 0)) < 0.005)
+
+
+def record_part_refund(booking_id, sent, owed):
+    """The team sent `sent` — the part refund they saw — but before they marked it the host
+    called the event off, so the booking now owes `owed`: all the guest paid. Records `sent`
+    as refunded on this row and queues the rest on its own row, the same shape cancel_event
+    step 3 leaves for a guest who was already partly refunded: the original's kept part
+    becomes the rest, in ticket_total alone, so refund_of() on it reads exactly `sent` and
+    nothing on it is the host's or GharSe's.
+
+    The UPDATE re-checks it all — still 'Refund due', a guest cancellation on an event that
+    is now cancelled, owing exactly `owed`, which is everything paid — and only the call
+    that moves the row queues the rest, so a double click or a second admin can't queue it
+    twice. Returns the new row's id, or None if nothing was recorded."""
+    try:
+        sent, owed = round(float(sent), 2), round(float(owed), 2)
+    except (TypeError, ValueError):
+        return None
+    if sent <= 0.005 or sent >= owed - 0.005:
+        return None
+    rest = round(owed - sent, 2)
+    moved = execute(
+        "UPDATE event_bookings SET payment_status='Refunded', ticket_total=?, platform_fee=0, ops_fee=0, "
+        "host_payout=0 WHERE id=? AND status='Cancelled' AND payment_status='Refund due' "
+        f"AND ABS({_REFUND_SQL} - ?) < 0.005 AND ABS(COALESCE(customer_total,0) - ?) < 0.005 "
+        "AND EXISTS (SELECT 1 FROM events e WHERE e.id=event_bookings.event_id AND e.status='Cancelled') "
+        "RETURNING id", (rest, booking_id, owed, owed))
+    if moved is None:
+        return None
+    rest_id = execute(
+        "INSERT INTO event_bookings (event_id, user_id, qty, ticket_total, platform_fee, ops_fee, "
+        "customer_total, host_payout, payment_status, payment_ref, status, created_at) "
+        "SELECT event_id, user_id, 0, 0, 0, 0, ?, 0, 'Refund due', payment_ref, 'Event cancelled', ? "
+        "FROM event_bookings WHERE id=? RETURNING id", (rest, store.now_iso(), booking_id))
+    b = dict(q("SELECT * FROM event_bookings WHERE id=?", (booking_id,))[0])
+    ev = q("SELECT title FROM events WHERE id=?", (b["event_id"],))
+    _tell(b["user_id"], "guest", "refund sent",
+          f"{rs(refund_of(b))} of your refund for \"{ev[0]['title'] if ev else 'your GharSe event'}\" has been "
+          f"sent. The remaining {rs(rest)} is on its way.", booking_id)
+    return rest_id
 
 
 # Escrow: Paid seats of events that have ENDED and were not called off. Cancelled-by-guest
@@ -996,11 +1077,12 @@ def _booking_panel(user, me, event_id, ctx):
         if left <= 0:
             st.warning("Sold out — every seat is taken.")
             return
-        top_qty = min(left, seat_limit(ev))
+        limit = seat_limit(ev)
+        top_qty = min(left, limit)
         qty = st.number_input("Seats", 1, top_qty, 1, step=1, key=f"sb_qty{ev['id']}",
                               help=f"Up to {top_qty}. Everyone you bring must meet the age limit."
-                              + (f" One account can hold at most {MAX_UNCONFIRMED_SEATS} paid seats while the "
-                                 "payment is being checked." if seat_limit(ev) == MAX_UNCONFIRMED_SEATS else ""))
+                              + (f" One account can hold at most {limit} paid seat{'s' if limit != 1 else ''} "
+                                 "while the payment is being checked." if (ev["ticket_price"] or 0) > 0 else ""))
         s = split_on_top((ev["ticket_price"] or 0) * int(qty))
         if s["customer_total"] > 0:
             st.markdown(breakdown(s, int(qty)), unsafe_allow_html=True)
@@ -1348,10 +1430,10 @@ def social_admin(admin_user):
         "SELECT b.*, e.title, e.starts_at, e.host_user_id, "
         "(SELECT COUNT(*) FROM event_bookings x WHERE x.user_id=b.user_id AND x.payment_status='Rejected') "
         "rejected_n FROM event_bookings b JOIN events e ON e.id=b.event_id "
-        "WHERE b.payment_status='Claimed' ORDER BY b.created_at, b.id")]
+        "WHERE b.payment_status='Claimed' ORDER BY COALESCE(b.claimed_at, b.created_at), b.id")]
     refunds = [dict(r) for r in q(
-        "SELECT b.*, e.title, e.starts_at FROM event_bookings b JOIN events e ON e.id=b.event_id "
-        "WHERE b.payment_status='Refund due' ORDER BY b.id")]
+        "SELECT b.*, e.title, e.starts_at, e.status ev_status FROM event_bookings b "
+        "JOIN events e ON e.id=b.event_id WHERE b.payment_status='Refund due' ORDER BY b.id")]
     fees = q("SELECT COALESCE(SUM(b.platform_fee + b.ops_fee),0) s FROM event_bookings b "
              "JOIN events e ON e.id=b.event_id WHERE e.status != 'Cancelled' "
              "AND b.payment_status IN ('Paid','Refund due','Refunded') AND b.status IN ('Booked','Cancelled')")[0]["s"]
@@ -1418,20 +1500,29 @@ def social_admin(admin_user):
         else:
             st.caption("Mark a refund only after sending the amount shown. If the amount changes before you "
                        "click (say the host cancels the event), nothing is recorded and you're asked to recheck.")
+        # Part refunds the team said they had sent when "Mark refunded" was refused because the
+        # booking had grown since (booking id -> amount seen). Kept for the session, so the
+        # offer to record it outlives the one-time flash; dropped once the row is settled.
+        sent_seen = st.session_state.setdefault(_SENT_KEY, {})
+        for gone in set(sent_seen) - {b["id"] for b in refunds}:
+            sent_seen.pop(gone, None)
         for b in refunds:
             g = _person(b["user_id"])
+            back = refund_of(b)
             with st.container(border=True):
                 cc = st.columns([3, 1])
                 cc[0].markdown(
                     f"<b>Booking #{h(b['id'])} · {h(b['title'])}</b> <span class='pill flat'>{h(b['status'])}</span><br>"
                     f"<span class='muted'>{h(g['first'])} · {h(g['phone'] or 'no phone')} · paid "
                     f"{rs(b['customer_total'])} · UTR {h(b['payment_ref'] or '—')}</span>", unsafe_allow_html=True)
-                cc[1].markdown(f"<div class='price'>{rs(refund_of(b))}</div><span class='muted'>to refund</span>",
+                cc[1].markdown(f"<div class='price'>{rs(back)}</div><span class='muted'>to refund</span>",
                                unsafe_allow_html=True)
                 # The amount on screen travels with the click (callback args are bound when the
                 # button is drawn), so a figure that changed since is refused, not recorded.
                 st.button("Mark refunded", key=f"sarefd{b['id']}", on_click=_mark_refunded_click,
-                          args=(b["id"], refund_of(b)))
+                          args=(b["id"], back))
+                if part_refund_applies(b, b["ev_status"]):
+                    _part_refund_controls(b, back, sent_seen.get(b["id"]))
     with tabs[2]:
         _admin_payouts(owed)
     with tabs[3]:
@@ -1452,32 +1543,90 @@ def _ago(ts):
 
 
 def _claim_flags(b):
-    """How long this claim has held its seats, and how many of this account's claims the
-    team has already found to be unpaid — so a squatter is easy to spot."""
-    t = _parse(b["created_at"])
+    """How long this claim has waited since the guest sent the reference (claimed_at), and
+    how many of this account's claims the team has already found to be unpaid — so a
+    squatter is easy to spot."""
+    since = _get(b, "claimed_at") or b["created_at"]
+    t = _parse(since)
     late = t is not None and now_ist() - t > timedelta(hours=CLAIM_SLA_HOURS)
-    wait = (f"<span class='pill {'warn' if late else 'flat'}'>Waiting {h(_ago(b['created_at']))}</span>")
+    wait = (f"<span class='pill {'warn' if late else 'flat'}'>Waiting {h(_ago(since))}</span>")
     n = int(b.get("rejected_n") or 0)
     rej = (f"<span class='pill warn'>{n} earlier claim{'s' if n != 1 else ''} rejected on this account</span>"
            if n else "<span class='pill flat'>No rejected claims on this account</span>")
-    return f"{wait} {rej} <span class='muted'>· waiting counts from when the seats were booked</span>"
+    # Claims made before claimed_at was recorded have only the booking time to go by.
+    old = "" if _get(b, "claimed_at") else " <span class='muted'>· an older claim: counted from the booking</span>"
+    return f"{wait} {rej}{old}"
+
+
+_SENT_KEY = "sa_part_sent"
 
 
 def _mark_refunded_click(booking_id, seen):
+    sent_seen = st.session_state.setdefault(_SENT_KEY, {})
     if mark_refunded(booking_id, seen):
+        sent_seen.pop(booking_id, None)
         _set_flash("sa_flash", True, f"Refund of {rs(seen)} for booking #{booking_id} recorded.")
         return
-    rows = q("SELECT * FROM event_bookings WHERE id=?", (booking_id,))
+    rows = q("SELECT b.*, e.status ev_status FROM event_bookings b JOIN events e ON e.id=b.event_id "
+             "WHERE b.id=?", (booking_id,))
     b = dict(rows[0]) if rows else None
     if b and b["payment_status"] == "Refund due":
         now_owed = refund_of(b)
-        extra = (f" If you already sent {rs(seen)}, send the remaining {rs(now_owed - seen)}, then mark it refunded."
-                 if now_owed > seen + 0.005 else "")
+        extra = ""
+        if now_owed > seen + 0.005 and part_refund_applies(b, b["ev_status"]):
+            # Remembered for the session: the booking below now offers to record what was sent.
+            sent_seen[booking_id] = seen
+            extra = (f" If you already sent {rs(seen)}, use \"I already sent {rs(seen)}\" on the booking below — "
+                     f"it records that and queues the remaining {rs(now_owed - seen)} on its own. If you haven't, "
+                     f"send {rs(now_owed)}, then mark it refunded.")
         _set_flash("sa_flash", False, f"Nothing recorded: booking #{booking_id} now owes {rs(now_owed)}, not the "
                                       f"{rs(seen)} you saw — it changed (for example the event was cancelled)."
                                       + extra)
     else:
+        sent_seen.pop(booking_id, None)
         _set_flash("sa_flash", False, "Someone else already handled it.")
+
+
+def _part_refund_controls(b, owed, seen):
+    """For a guest who cancelled before the event was called off, whose part refund has
+    become a full one: record a part the team had already sent, so the whole amount is
+    never sent again. Right after "Mark refunded" was refused, the amount they saw is
+    offered as it was; otherwise (say after a reload) they enter what they sent."""
+    if seen is not None and owed > seen + 0.005:
+        st.button(f"I already sent {rs(seen)} — record it and queue the remaining {rs(owed - seen)}",
+                  key=f"sarefp{b['id']}", on_click=_part_refund_click, args=(b["id"], seen, owed))
+        return
+    with st.expander("Already sent part of this refund?"):
+        _note("This guest cancelled before the event was called off, which turns a part refund into a full one. "
+              "If you had already sent the smaller amount, don't send this whole amount again: record what you "
+              "sent, and the rest is queued as a refund of its own.")
+        with st.form(f"sarefpf{b['id']}", border=False):
+            fc = st.columns([2, 2])
+            fc[0].number_input("Already sent (₹)", 0.0, max(0.0, owed - 0.01), 0.0, step=1.0,
+                               key=f"sarefpa{b['id']}")
+            # As with "Mark refunded", the amount owed on screen is bound to the click.
+            fc[1].form_submit_button("Record it and queue the rest", on_click=_part_refund_entered,
+                                     args=(b["id"], owed))
+
+
+def _part_refund_entered(booking_id, owed):
+    sent = float(st.session_state.get(f"sarefpa{booking_id}") or 0)
+    if sent <= 0.005 or sent >= owed - 0.005:
+        _set_flash("sa_flash", False, f"Booking #{booking_id}: enter the part you already sent — more than ₹0 and "
+                                      f"less than {rs(owed)}. For the whole amount, use Mark refunded.")
+        return
+    _part_refund_click(booking_id, sent, owed)
+
+
+def _part_refund_click(booking_id, sent, owed):
+    st.session_state.setdefault(_SENT_KEY, {}).pop(booking_id, None)
+    rest_id = record_part_refund(booking_id, sent, owed)
+    if rest_id is None:
+        _set_flash("sa_flash", False, f"Nothing recorded: booking #{booking_id} has changed or someone else already "
+                                      "handled it. Check the amount it shows now.")
+        return
+    _set_flash("sa_flash", True, f"Recorded {rs(sent)} refunded on booking #{booking_id}. The remaining "
+                                 f"{rs(owed - sent)} is queued as booking #{rest_id} — send it, then mark it refunded.")
 
 
 def _host_upi(host_id):

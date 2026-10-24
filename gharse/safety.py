@@ -11,10 +11,12 @@
 # hold and lift. Reporters are told when the team has reviewed their report.
 #
 # Only reporters in good standing count toward an automatic hold: phone-verified, not on
-# hold themselves, never had an earlier report on the same account closed by the team,
-# and either ID-verified or linked to that account by a paid booking or room request.
-# Three throwaway sign-ups therefore cannot take a verified host's events down, and the
-# same people cannot re-hold an account the team has just cleared.
+# hold themselves, and either ID-verified or linked to that account by a paid booking or
+# room request. A reporter whose earlier report on the same account the team dismissed
+# never counts against it again; one whose report was resolved counts again only with a
+# report filed after that resolution. Three throwaway sign-ups therefore cannot take a
+# verified host's events down, the same people cannot re-hold an account the team has
+# cleared, and a genuine victim of a repeat offender is not dropped from the count.
 #
 # Every state change here is a single conditional statement (… WHERE NOT EXISTS / WHERE
 # status='open' … RETURNING id), so a double click or two admins on the same row can
@@ -179,22 +181,37 @@ def _counting_reporters(target_user_id):
     """The reporters whose open reports count toward an automatic hold on this account.
 
     A reporter counts only when in good standing: phone-verified (one phone per
-    account), not on hold, no earlier report on this account already closed by the
-    team (so the people whose reports were just reviewed cannot re-hold it at once),
-    and either ID-verified or linked to the account by a paid event booking or room
-    request in either direction. "Paid" means real money changed hands: a free event's
-    booking is recorded 'Paid' at once with customer_total 0, so it does not count —
-    otherwise three phone-only accounts could book a free meetup and hold its host.
+    account), not on hold, and either ID-verified or linked to the account by a paid
+    event booking or room request in either direction. "Paid" means real money changed
+    hands: a free event's booking is recorded 'Paid' at once with customer_total 0, so
+    it does not count — otherwise three phone-only accounts could book a free meetup
+    and hold its host.
+
+    What the team did with the reporter's earlier reports on this account matters too:
+    - dismissed (the team found it unfounded): that reporter never counts toward a hold
+      on this account again, so three people cannot re-hold someone the team cleared.
+    - resolved (it was genuine and acted on): only their open reports filed after the
+      latest resolution count, so a real victim of a repeat offender stays in the count,
+      but a report that was already open when the team acted counts as part of what
+      was handled.
+      A resolved report with no resolved_at (older data) is treated like a dismissal,
+      so old rows cannot re-trigger a hold.
     Everyone else's report still reaches the team."""
     if target_user_id is None:
         return set()
+    # One NOT EXISTS for both rules: r counts unless the same reporter has a dismissed
+    # report here, or a resolved one with no time or a time at or after r was filed
+    # (ISO strings from now_iso() compare lexically; an r with no created_at is never
+    # after anything).
     rows = q(
         "SELECT DISTINCT r.reporter_user_id rid FROM reports r "
         "JOIN users u ON u.id = r.reporter_user_id "
         "WHERE r.target_user_id=? AND r.status='open' AND r.reporter_user_id<>r.target_user_id "
         "AND COALESCE(u.phone_verified,0)=1 AND COALESCE(u.suspended,0)=0 "
         "AND NOT EXISTS (SELECT 1 FROM reports c WHERE c.reporter_user_id=r.reporter_user_id "
-        "AND c.target_user_id=r.target_user_id AND c.status IN ('dismissed','resolved')) "
+        "AND c.target_user_id=r.target_user_id AND (c.status='dismissed' "
+        "OR (c.status='resolved' AND (COALESCE(c.resolved_at,'')='' "
+        "OR c.resolved_at>=COALESCE(r.created_at,''))))) "
         "AND (u.kyc_status='verified' "
         "OR EXISTS (SELECT 1 FROM event_bookings b JOIN events e ON e.id = b.event_id "
         "WHERE b.payment_status IN (?,?,?,?) AND COALESCE(b.customer_total,0) > 0 "
