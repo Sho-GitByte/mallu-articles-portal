@@ -440,6 +440,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_blocks_user ON blocks (user_id)",
     "CREATE INDEX IF NOT EXISTS ix_events_live ON events (status, starts_at)",
     "CREATE INDEX IF NOT EXISTS ix_bookings_event ON event_bookings (event_id)",
+    "CREATE INDEX IF NOT EXISTS ix_bookings_user ON event_bookings (user_id, event_id)",
+    # Messages are looked up by what they are about: "already told?" checks, the Outbox.
+    "CREATE INDEX IF NOT EXISTS ix_notifications_ref ON notifications (kind, order_id)",
     "CREATE INDEX IF NOT EXISTS ix_rentals_live ON rentals (status, area)",
     "CREATE INDEX IF NOT EXISTS ix_rental_req ON rental_requests (rental_id)",
 ]

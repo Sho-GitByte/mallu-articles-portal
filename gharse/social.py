@@ -37,13 +37,18 @@
 # all and the host is still paid for that seat once the event has ended.
 #
 # Calling an event off is two things. The flip (UPDATE events … WHERE status='Published')
-# decides only which call tells the host. Giving the money back is _settle_cancelled's, and
-# it runs whenever the event reads Cancelled: straight after the flip whatever that returned
-# or raised (on Postgres a write whose connection drops is raised, not sent again, and may
-# have committed), on a host's retry of an event already off, and from Events Admin for any
-# cancelled event with a booking still unsettled — say the process died after the flip, when
-# the event is already off every list it could be retried from. Each booking is moved out of
-# the shape it reads in by one conditional UPDATE that re-checks that shape:
+# decides only which call tells the host — at once, before any settling, so a settling write
+# that raises can't swallow it. Giving the money back is _settle_cancelled's, and it runs
+# whenever the event reads Cancelled: straight after the flip whatever that returned or
+# raised (on Postgres a write whose connection drops is raised, not sent again, and may have
+# committed), on a host's retry of an event already off, and from Events Admin and Events &
+# Meetups for any cancelled event with a booking still unsettled — say the process died after
+# the flip, when the event is already off every list it could be retried from. Until then a
+# guest's booking may still read Booked, so a called-off event never offers a payment or a
+# seat cancellation, and cancel_booking re-checks the event in its UPDATE. Each booking is
+# moved out of the shape it reads in by one conditional UPDATE that re-checks that shape (a
+# booking that changed between the SELECT and its UPDATE — a guest cancelling from a page
+# drawn before the flip — is settled from the shape it reads in then):
 #   * a live seat, or a guest's own cancellation GharSe holds money on and kept some or all
 #     of (Paid after a late cancellation, or under "No refunds") or hasn't matched yet
 #     (Claimed, Rejected) — status "Event cancelled", nothing kept: a plain full refund on
@@ -58,15 +63,25 @@
 # INSERT adds one only where there is none, a post-commit re-check removes a copy two racing
 # calls both added (every copy still due once one has been refunded), and the next settling
 # queues one still missing. So however often, and however many calls at once, it runs, a
-# booking is settled once and a rest is neither lost nor queued twice. Each guest is told by
-# the call that settled their bookings, as soon as it has, and once: a guest with an "event
-# cancelled" message on record is not told again.
+# booking is settled once and a rest is neither lost nor queued twice.
+#
+# Each guest is told by the call that settled their bookings, as soon as it has, and once.
+# An "event cancelled" message (to a guest, or to a host whose event the team called off) is
+# claimed before it is sent, the same way a rest is queued: an INSERT of a 'Queued' record
+# that adds one only where there is none, then a post-commit re-check that removes every
+# claim but the earliest (lowest id), then one conditional UPDATE that takes the send for a
+# claim only while no other record of it is being sent or sent; only that call sends it
+# (_tell_once). A claim whose sending never happened stays 'Queued' in the Outbox, where the
+# team sends it with one tap. Events Admin and Events & Meetups tell anyone of a cancelled
+# event who has no such record yet (tell_cancelled), so a message lost to a raise or a crash
+# before its claim is sent later — once.
 #
 # Before settling split a part refund like this, calling the event off grew it into a full
 # one on the same row. Such a row (owing all that was paid, under a rule that refunds part,
 # like 50%) may hide a part the team had already sent, so Events Admin flags it "Check
 # before sending" and lets them record what they sent (record_part_refund), which splits it
-# the same way. Settling never leaves a row in that shape.
+# the same way. Settling never leaves a row in that shape. The flag is left off where the
+# guest's own "booking cancelled" message says no refund applied: no part was ever due.
 #
 # Payment references are 12-digit UPI UTRs, and a reference can be on one booking only. A
 # claim the team rejects is final for that booking: the seats are released and the
@@ -74,7 +89,7 @@
 # the team re-opens it from Events Admin and it is refunded.
 #
 # Tables: events, event_bookings, social_payouts (read/write); users (read, and write of
-# users.interests); notifications (via ui.notify).
+# users.interests); notifications (via ui.notify, and claimed directly for "event cancelled").
 
 import re
 from datetime import datetime, time, timedelta
@@ -96,6 +111,7 @@ from ui import (
     notify,
     process_image,
     safe_image,
+    send_whatsapp,
     split_on_top,
     table,
     wa_link,
@@ -300,6 +316,54 @@ def _person(user_id, fallback="Guest"):
 def _tell(user_id, role, kind, body, ref=None):
     p = _person(user_id)
     notify(p["phone"], p["first"], role, kind, body, ref)
+
+
+# What a claimed message (_tell_once) carries in its error column while the app is sending
+# it. It is still 'Queued', so if the app stops right then the Outbox shows it, saying so.
+_SENDING = "the app was sending this when it stopped — check with them before sending it again"
+
+
+def _tell_once(user_id, role, kind, body, ref, same_sql, same_params):
+    """Send a message that no other call has sent or is sending. `same_sql` (bound with
+    `same_params`, on notifications' own columns) says which records of this kind and role
+    count as the same message.
+
+    The record comes first: an INSERT of a 'Queued' claim that adds one only where there is
+    none. On Postgres two calls can both read the NOT EXISTS before either commits, so a
+    post-commit re-check removes every claim but the earliest (lowest id) that nobody has
+    started sending. The send is then taken by one conditional UPDATE that marks this
+    call's claim (_SENDING) only if it is still there, unmarked, and no other record of the
+    message is being sent or sent. A call whose claim can't be marked removes it and sends
+    nothing; the one that marks it sends with ui.send_whatsapp and records what happened
+    the way ui.notify does. However the calls interleave, at most one claim is marked. Say
+    a later claim was added and checked while an earlier one was still uncommitted: the
+    earlier call's re-check either removes it before it is marked, or finds it already
+    marked and leaves it — the re-check and the mark write the same row, so Postgres runs
+    them one after the other — and then the earlier call's own mark sees it and gives way.
+    A claim left by a raise or a crash stays 'Queued' in the Outbox, where the team sends it
+    with one tap. Returns True if this call is the one that sent it (or, with no way to
+    send, left it queued)."""
+    p = _person(user_id)
+    same = "kind=? AND to_role=? AND " + same_sql
+    key = (kind, role, *same_params)
+    nid = execute(
+        "INSERT INTO notifications (to_phone, to_name, to_role, kind, body, order_id, status, created_at) "
+        "SELECT ?,?,?,?,?,?,'Queued',? WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE " + same + ") "
+        "RETURNING id", (p["phone"], p["first"], role, kind, body, ref, store.now_iso(), *key))
+    if nid is None:
+        return False
+    execute("DELETE FROM notifications WHERE " + same + " AND status='Queued' AND error IS NULL "
+            "AND id > (SELECT MIN(id) FROM notifications WHERE " + same + ")", key + key)
+    if execute("UPDATE notifications SET error=? WHERE id=? AND status='Queued' AND error IS NULL "
+               "AND NOT EXISTS (SELECT 1 FROM notifications n WHERE " + same + " AND n.id != ? "
+               "AND (n.status != 'Queued' OR n.error IS NOT NULL)) RETURNING id",
+               (_SENDING, nid, *key, nid)) is None:
+        execute("DELETE FROM notifications WHERE id=? AND status='Queued' AND error IS NULL", (nid,))
+        return False
+    sent, err = send_whatsapp(p["phone"], body)
+    execute("UPDATE notifications SET status=?, error=?, sent_at=? WHERE id=?",
+            ("Sent" if sent else "Queued", err, store.now_iso() if sent else None, nid))
+    return True
 
 
 def _para(text):
@@ -523,7 +587,10 @@ def claim(booking, user_id, ref):
 
 def cancel_booking(booking, user_id, event):
     """Guest cancels before the event starts. Seats are released; what was paid is
-    refunded per the event's refund rule. Returns (ok, refund, message)."""
+    refunded per the event's refund rule. Only while the event is still on, checked in the
+    UPDATE itself: once it is called off its own settling refunds the seat in full, and a
+    page drawn before that must not turn the seat into a part refund. Returns (ok, refund,
+    message)."""
     start = _parse(event["starts_at"])
     if start and start <= now_ist():
         return False, 0.0, "The event has started — it can't be cancelled now."
@@ -538,20 +605,28 @@ def cancel_booking(booking, user_id, event):
     ok = execute(
         "UPDATE event_bookings SET status='Cancelled', ticket_total=?, platform_fee=?, ops_fee=?, "
         "host_payout=?, payment_status=? WHERE id=? AND user_id=? AND status=? AND payment_status=? "
+        "AND EXISTS (SELECT 1 FROM events e WHERE e.id=event_bookings.event_id AND e.status='Published') "
         "RETURNING id",
         (kept["ticket_total"], kept["platform_fee"], kept["ops_fee"], kept["host_payout"], new_pay,
          booking["id"], user_id, ACTIVE, pay))
     if ok is None:
+        if q("SELECT 1 FROM events WHERE id=? AND status='Cancelled'", (booking["event_id"],)):
+            return False, 0.0, ("This event has been called off, so there's nothing to cancel — anything you paid "
+                                "comes back in full.")
         return False, 0.0, "This booking changed while you were looking at it — refresh and try again."
     return True, refund, None
 
 
 def cancel_event(event_id, reason, by):
-    """Host or team calls an event off. Every rupee GharSe still holds for it goes back —
-    that is _settle_cancelled's, which runs here whatever the flip returned or raised, so a
-    host retrying an event that is already off settles anything still open. Returns True
-    only for the call whose flip took effect; that call tells the host when the team did it.
-    Guests are told by whichever call settled their bookings."""
+    """Host or team calls an event off. Returns True only for the call whose flip took
+    effect, and when the team did it that call tells the host straight away, before any
+    settling, so a settling write that raises after committing can't keep the host from
+    hearing. (A flip that raised can't know it took effect, so it tells nobody; the next
+    Events Admin or Events & Meetups page tells that host — tell_cancelled, once.) Every
+    rupee GharSe still holds for the event goes back: that is _settle_cancelled's, which
+    runs here whatever the flip returned or raised, and even if telling the host raised, so
+    a host retrying an event that is already off settles anything still open. Guests are
+    told by whichever call settled their bookings."""
     reason = (reason or "").strip()
     try:
         flipped = execute("UPDATE events SET status='Cancelled', cancel_reason=? WHERE id=? AND status='Published' "
@@ -561,15 +636,12 @@ def cancel_event(event_id, reason, by):
         # have committed: settle the event if it now reads Cancelled, then let the page know.
         _settle_cancelled(event_id)
         raise
-    _settle_cancelled(event_id)
-    if flipped is None:
-        return False
-    if by != "host":
-        ev = q("SELECT title, host_user_id FROM events WHERE id=?", (event_id,))[0]
-        _tell(ev["host_user_id"], "host", "event cancelled",
-              f"The GharSe team has cancelled your event \"{ev['title']}\". Reason: {reason}. "
-              f"All guests are being refunded.", event_id)
-    return True
+    try:
+        if flipped is not None and by != "host":
+            _tell_host(event_id)
+    finally:
+        _settle_cancelled(event_id)
+    return flipped is not None
 
 
 # ----------------------------------------------------------------------------- payments
@@ -652,9 +724,11 @@ def reopen_payment(booking_id):
 def mark_refunded(booking_id, amount):
     """Record that `amount` — the refund the admin saw on screen and sent — has gone back.
     Refused (False) unless the booking is still 'Refund due' AND still owes exactly that
-    amount, checked in the UPDATE itself: if the host called the event off in between (so
-    a partial refund became a full one), the admin is asked to recheck instead of the
-    bigger figure being recorded as sent."""
+    amount, checked in the UPDATE itself: a second click or a second admin finds it already
+    marked, and a figure that changed since the page was drawn (say record_part_refund split
+    the row) is never recorded as sent — the admin is asked to recheck. Calling the event off
+    doesn't change what a refund that is due owes: a part refund keeps owing its part, and
+    the part its rule kept is queued on a row of its own (see the header)."""
     try:
         amount = round(float(amount), 2)
     except (TypeError, ValueError):
@@ -706,13 +780,15 @@ _CALLED_OFF_SQL = "EXISTS (SELECT 1 FROM events e WHERE e.id=event_bookings.even
 
 def _settle_cancelled(event_id):
     """Give back every rupee GharSe still holds for a cancelled event, and tell each guest
-    whose bookings this call settled. Runs after every flip (cancel_event) and from Events
-    Admin (settle_cancelled_events); safe to run any number of times, by any number of calls
-    at once. Each statement moves one booking out of the shape it was read in and re-checks
-    that shape itself, so a booking is settled once; a split row's rest is queued from the
-    row's shape (_queue_rest), never from what an UPDATE returned, so a statement that
-    raised after committing, or a process that died in between, is finished by the next
-    run. Returns the guests this call settled."""
+    whose bookings this call settled. Runs after every flip (cancel_event) and whenever
+    Events Admin or Events & Meetups opens (settle_cancelled_events); safe to run any number
+    of times, by any number of calls at once. Each statement moves one booking out of the
+    shape it was read in and re-checks that shape itself, so a booking is settled once — and
+    a booking that changed between the SELECT and its UPDATE is settled from the shape it
+    reads in then. A split row's rest is queued from the row's shape (_queue_rest), never
+    from what an UPDATE returned, so a statement that raised after committing, or a process
+    that died in between, is finished by the next run. Returns the guests this call
+    settled."""
     ev = q("SELECT title, starts_at, cancel_reason FROM events WHERE id=? AND status='Cancelled'", (event_id,))
     if not ev:
         return []
@@ -722,20 +798,23 @@ def _settle_cancelled(event_id):
              (event_id,))
     settled = []
     # One guest at a time, told as soon as their bookings are settled, so a crash part-way
-    # leaves at most one guest settled but not told.
+    # leaves at most one guest settled but not told (tell_cancelled tells them later).
     for uid in dict.fromkeys(r["user_id"] for r in rows):
         moved = False
         for b in (r for r in rows if r["user_id"] == uid):
-            if b["step"] == "full":
-                # A live seat or a held cancellation: nothing is kept, it all comes back here.
-                moved |= execute(
+            # A live seat or a held cancellation: nothing is kept, it all comes back here.
+            if b["step"] == "full" and execute(
                     "UPDATE event_bookings SET status='Event cancelled', ticket_total=0, platform_fee=0, ops_fee=0, "
                     "host_payout=0, payment_status=CASE WHEN payment_status='Paid' AND COALESCE(customer_total,0) > 0 "
                     "THEN 'Refund due' ELSE payment_status END WHERE id=? AND (status='Booked' OR ("
-                    + _HELD_SQL + ")) AND " + _CALLED_OFF_SQL + " RETURNING id",
-                    (b["id"],)) is not None
+                    + _HELD_SQL + ")) AND " + _CALLED_OFF_SQL + " RETURNING id", (b["id"],)) is not None:
+                moved = True
                 continue
-            if b["step"] == "split":
+            # A "full" row that UPDATE didn't match is not a live seat or a held cancellation
+            # any more — say the guest cancelled from a page drawn before the flip, and their
+            # rule kept part. It is settled from the shape it reads in now: the split and
+            # _queue_rest re-check theirs, and match nothing if there is nothing left to settle.
+            if b["step"] in ("full", "split"):
                 # The row keeps owing (or having had) exactly its part refund; the kept part
                 # moves into ticket_total alone, and _queue_rest refunds it on a row of its own.
                 moved |= execute(
@@ -751,41 +830,103 @@ def _settle_cancelled(event_id):
 
 
 def settle_cancelled_events():
-    """Events Admin's repair for cancel_event. An event whose flip committed but whose
-    settling never finished — the call raised after the flip, or the process died — reads
-    Cancelled, is off every list a host or the team could retry it from, and still has
-    bookings unsettled. Runs whenever Events Admin opens."""
+    """The repair for cancel_event, run whenever Events Admin or Events & Meetups opens. An
+    event whose flip committed but whose settling never finished — the call raised after the
+    flip, or the process died — reads Cancelled, is off every list a host or the team could
+    retry it from, and still has bookings unsettled. Settling it here, before anything is
+    drawn, also means no page shows such a booking as one that can be paid or cancelled.
+    Then anyone a called-off event should have told and didn't is told (tell_cancelled)."""
     for r in q("SELECT DISTINCT o.event_id FROM event_bookings o WHERE " + _UNSETTLED_SQL + " "
                "AND EXISTS (SELECT 1 FROM events e WHERE e.id=o.event_id AND e.status='Cancelled') ORDER BY o.event_id"):
         _settle_cancelled(r["event_id"])
+    tell_cancelled()
+
+
+# A guest's "event cancelled" message is a record on any of their bookings of the event
+# (bound as event_id, user_id), on notifications' own columns.
+_GUEST_TOLD_SQL = "order_id IN (SELECT tb.id FROM event_bookings tb WHERE tb.event_id=? AND tb.user_id=?)"
+# The rows of a called-off event a guest is told about, as `b`: what settling gave back or
+# is still matching — not a claim the team found unpaid (that guest was told so; once it is
+# re-opened, the row counts again).
+_TOLD_ABOUT_SQL = ("COALESCE(b.payment_status,'') != 'Rejected' AND (b.status='Event cancelled' OR "
+                   "(b.status='Cancelled' AND b.payment_status IN ('Refund due','Claimed')))")
+
+
+def _reason_of(cancel_reason):
+    """cancel_event stores the reason as "<reason> (<who>)"; this is the reason alone."""
+    reason = cancel_reason or ""
+    return reason.rsplit(" (", 1)[0] if reason.endswith(")") else reason
 
 
 def _tell_guest(ev, event_id, user_id):
-    """Tell a guest the event is off and what is coming back to them — unless they already
-    have that message on record (their bookings settled in two goes, or a booking left from
-    before this was told when the event was called off), so nobody is told twice."""
-    if q("SELECT 1 FROM notifications WHERE kind='event cancelled' AND to_role='guest' AND order_id IN "
-         "(SELECT b.id FROM event_bookings b WHERE b.event_id=? AND b.user_id=?)", (event_id, user_id)):
+    """Tell a guest the event is off and what is coming back to them — once (_tell_once):
+    not if they already have that message on record (their bookings settled in two goes, a
+    booking left from before that was told when the event was called off, or another call
+    telling them at the same moment)."""
+    if q("SELECT 1 FROM notifications WHERE kind='event cancelled' AND to_role='guest' AND " + _GUEST_TOLD_SQL,
+         (event_id, user_id)):
         return
-    rows = [dict(r) for r in q(
-        "SELECT * FROM event_bookings WHERE event_id=? AND user_id=? AND COALESCE(payment_status,'') != 'Rejected' "
-        "AND (status='Event cancelled' OR (status='Cancelled' AND payment_status IN ('Refund due','Claimed'))) "
-        "ORDER BY id", (event_id, user_id))]
+    rows = [dict(r) for r in q("SELECT * FROM event_bookings b WHERE b.event_id=? AND b.user_id=? AND "
+                               + _TOLD_ABOUT_SQL + " ORDER BY b.id", (event_id, user_id))]
     if not rows:
         return
-    due = sum(refund_of(b) for b in rows if b["payment_status"] == "Refund due")
+    # A split row's rest can briefly have a second copy (racing _queue_rest calls, before
+    # _drop_extra_rests runs): count each rest once — none at all once a copy is refunded.
+    rests = {}
+    for b in rows:
+        if b["qty"] == 0 and b["status"] == "Event cancelled":
+            rests.setdefault(b["payment_ref"] or "", []).append(b)
+    extra = {b["id"] for copies in rests.values() for b in
+             (copies if any(c["payment_status"] == "Refunded" for c in copies) else copies[1:])}
+    due = sum(refund_of(b) for b in rows if b["payment_status"] == "Refund due" and b["id"] not in extra)
     checking = sum(float(b["customer_total"] or 0) for b in rows if b["payment_status"] == "Claimed")
     money = ""
     if due > 0.005:
         money += f" {rs(due)} will be refunded to you."
     if checking > 0.005:
         money += f" Once the team has matched your payment of {rs(checking)}, all of it will be refunded to you."
-    # cancel_event stores the reason as "<reason> (<who>)".
-    reason = ev["cancel_reason"] or ""
-    reason = reason.rsplit(" (", 1)[0] if reason.endswith(")") else reason
-    _tell(user_id, "guest", "event cancelled",
-          f"Sorry — \"{ev['title']}\" on {when(ev['starts_at'])} has been cancelled. Reason: {reason}.{money}",
-          rows[0]["id"])
+    # The record goes on the guest's first booking of the event, which is never removed (a
+    # rest copy can be), so the message stays on record for as long as the bookings are.
+    first = q("SELECT MIN(id) m FROM event_bookings WHERE event_id=? AND user_id=?", (event_id, user_id))[0]["m"]
+    _tell_once(user_id, "guest", "event cancelled",
+               f"Sorry — \"{ev['title']}\" on {when(ev['starts_at'])} has been cancelled. "
+               f"Reason: {_reason_of(ev['cancel_reason'])}.{money}", first, _GUEST_TOLD_SQL, (event_id, user_id))
+
+
+def _tell_host(event_id):
+    """Tell the host the GharSe team has called their event off — once (_tell_once): by the
+    call whose flip took effect, or by tell_cancelled for a host nobody told."""
+    ev = q("SELECT title, host_user_id, cancel_reason FROM events WHERE id=? AND status='Cancelled'", (event_id,))
+    if not ev:
+        return
+    _tell_once(ev[0]["host_user_id"], "host", "event cancelled",
+               f"The GharSe team has cancelled your event \"{ev[0]['title']}\". Reason: "
+               f"{_reason_of(ev[0]['cancel_reason'])}. All guests are being refunded.", event_id,
+               "order_id=?", (event_id,))
+
+
+def tell_cancelled():
+    """The repair for the "event cancelled" messages, run with settle_cancelled_events. A
+    guest of a called-off event whose bookings are all settled, and a host whose event the
+    team called off, with no such message on record — the call raised, or the process died,
+    before its claim — is told now, once. A guest with a booking still unsettled is left to
+    the settling, which tells them with everything that is coming back."""
+    for r in q("SELECT DISTINCT b.event_id, b.user_id FROM event_bookings b JOIN events e ON e.id=b.event_id "
+               "WHERE e.status='Cancelled' AND " + _TOLD_ABOUT_SQL + " "
+               # A plain join, not IN (correlated subquery): both planners hash it, where the
+               # nested form re-ran once per (booking, message) pair on every page load.
+               "AND NOT EXISTS (SELECT 1 FROM notifications n JOIN event_bookings tb ON tb.id=n.order_id "
+               "WHERE n.kind='event cancelled' AND n.to_role='guest' "
+               "AND tb.event_id=b.event_id AND tb.user_id=b.user_id) "
+               "AND NOT EXISTS (SELECT 1 FROM event_bookings o WHERE o.event_id=b.event_id AND o.user_id=b.user_id "
+               "AND " + _UNSETTLED_SQL + ") ORDER BY b.event_id, b.user_id"):
+        ev = q("SELECT title, starts_at, cancel_reason FROM events WHERE id=?", (r["event_id"],))
+        _tell_guest(dict(ev[0]), r["event_id"], r["user_id"])
+    # A host who called it off needs no message; cancel_event stores who did as "(host)".
+    for r in q("SELECT e.id FROM events e WHERE e.status='Cancelled' AND e.cancel_reason NOT LIKE ? "
+               "AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.kind='event cancelled' AND n.to_role='host' "
+               "AND n.order_id=e.id) ORDER BY e.id", ("% (host)",)):
+        _tell_host(r["id"])
 
 
 def _queue_rest(booking_id):
@@ -845,10 +986,27 @@ def part_refund_applies(b, ev_status, rule):
     record_part_refund is offered. Settling never makes this shape now: a part refund keeps
     owing its part, and a guest who kept everything (a late cancellation) or hadn't been
     matched yet is refunded in full as "Event cancelled". Under an all-or-nothing rule there
-    was never a part to send."""
+    was never a part to send. Events Admin also leaves the offer off a row whose guest was
+    told no refund applied when they cancelled (told_no_refund)."""
     owed = refund_of(b)
     return (b["status"] == "Cancelled" and b["payment_status"] == "Refund due" and ev_status == "Cancelled"
             and part_rule(rule) and owed > 0.005 and abs(owed - float(b["customer_total"] or 0)) < 0.005)
+
+
+# How the guest's own "booking cancelled" message ends when their rule handed nothing back.
+NO_REFUND_LINE = "No refund applies under the event's refund rule."
+
+
+def told_no_refund(booking_id):
+    """The guest's own "booking cancelled" message for this booking says no refund applied:
+    they cancelled after the rule's deadline, so nothing was due and no part of a refund can
+    have gone back to them — a row from before that grew to the whole amount needs no check
+    before sending. Read from the message on record, never worked out again from the times,
+    and only from how it ENDS (the event's title, which the host typed, sits earlier in it,
+    so it can't pass for that line). No such message, or one that names a refund: False."""
+    bodies = [r["body"] or "" for r in q("SELECT body FROM notifications WHERE kind='booking cancelled' "
+                                         "AND to_role='guest' AND order_id=?", (booking_id,))]
+    return bool(bodies) and all(body.rstrip().endswith(NO_REFUND_LINE) for body in bodies)
 
 
 def record_part_refund(booking_id, sent, owed):
@@ -996,10 +1154,19 @@ def _private_address(booking_id, user_id):
 
 
 def _pay_box(b, ev, viewer_id, prefix):
-    """Pay, claim, or — once Paid — the exact address and the host's phone. `ev` never
-    needs to carry the address: it is fetched here for the booking's own guest."""
+    """Pay, claim, or — once Paid — the exact address and the host's phone, only while the
+    event is on (`ev["status"]` is 'Published'). `ev` never needs to carry the address: it
+    is fetched here for the booking's own guest."""
     pay = b["payment_status"] or "Unpaid"
     if b["user_id"] != viewer_id:
+        return
+    if ev.get("status") != "Published":
+        # A called-off event takes no payment and unlocks nothing, even while its settling
+        # is still finishing and the booking reads Booked.
+        if pay == "Unpaid" and (b["customer_total"] or 0) > 0 and b["status"] in (ACTIVE, "Expired", "Event cancelled"):
+            st.markdown("<span class='muted'>This event was called off, so it can't take a payment. If you had "
+                        "already paid, send the GharSe team a screenshot of the payment — we'll refund you in "
+                        f"full.</span><br>{safety.grievance_line()}", unsafe_allow_html=True)
         return
     if b["status"] == ACTIVE and pay == "Paid":
         address = _private_address(b["id"], viewer_id)
@@ -1067,6 +1234,7 @@ def social_home(user):
                 "verified neighbours. The exact address is shared only once your seat is paid for.</div>",
                 unsafe_allow_html=True)
     sweep_holds()
+    settle_cancelled_events()
     me = _me(user)
     ctx = {"terms_shown": False}
     _flash("sb_flash")
@@ -1323,7 +1491,7 @@ def _my_bookings(user, me):
             ev = {"id": b["ev_id"], "title": b["title"], "kind": b["kind"], "theme": b["theme"],
                   "area": b["area"], "venue_hint": b["venue_hint"],
                   "starts_at": b["starts_at"], "ends_at": b["ends_at"], "refund_rule": b["refund_rule"],
-                  "host_user_id": b["host_user_id"], "ticket_price": b["ticket_price"]}
+                  "host_user_id": b["host_user_id"], "ticket_price": b["ticket_price"], "status": b["ev_status"]}
             with st.container(border=True):
                 cc = st.columns([3, 1])
                 cc[0].markdown(_event_head(ev, b), unsafe_allow_html=True)
@@ -1331,7 +1499,7 @@ def _my_bookings(user, me):
                                unsafe_allow_html=True)
                 if b["status"] == ACTIVE and (b["customer_total"] or 0) > 0:
                     st.markdown(breakdown(b | {"base": b["ticket_total"]}, b["qty"]), unsafe_allow_html=True)
-                if b["status"] == "Event cancelled":
+                if b["status"] == "Event cancelled" or (b["status"] == ACTIVE and b["ev_status"] != "Published"):
                     _note(f"The event was cancelled. {b['cancel_reason'] or ''}")
                 if b["payment_status"] == "Rejected":
                     st.markdown("<span class='muted'>We couldn't find a UPI payment with the reference you "
@@ -1344,7 +1512,8 @@ def _my_bookings(user, me):
                     st.caption(f"{rs(refund_of(b))} was refunded.")
                 if label == "Upcoming":
                     _pay_box(b, ev, me["id"], "mb")
-                if label == "Upcoming" and b["status"] == ACTIVE and (b["starts_at"] or "") > now:
+                if (label == "Upcoming" and b["status"] == ACTIVE and b["ev_status"] == "Published"
+                        and (b["starts_at"] or "") > now):
                     _cancel_control(b, ev)
                 if label == "Upcoming":
                     safety.report_button(user, "event", ev["id"], ev["host_user_id"], key=f"mbrep{b['id']}")
@@ -1375,7 +1544,7 @@ def _cancel_control(b, ev):
             if pay != "Unpaid":
                 _tell(b["user_id"], "guest", "booking cancelled", f"Your booking for \"{ev['title']}\" is cancelled. "
                       + (f"{rs(refund)} will be refunded to you." if refund > 0.005
-                         else "No refund applies under the event's refund rule."), b["id"])
+                         else NO_REFUND_LINE), b["id"])
             _set_flash("sb_flash", True, msg)
             st.rerun()
 
@@ -1601,8 +1770,8 @@ def social_admin(admin_user):
                 "<div class='page-sub'>Confirm ticket payments, send refunds, pay hosts after their events end, "
                 "and moderate events.</div>", unsafe_allow_html=True)
     sweep_holds()
-    settle_cancelled_events()
     queue_missing_rests()
+    settle_cancelled_events()
     _flash("sa_flash")
     claimed = [dict(r) for r in q(
         "SELECT b.*, e.title, e.starts_at, e.host_user_id, "
@@ -1693,7 +1862,7 @@ def social_admin(admin_user):
                 # button is drawn), so a figure that changed since is refused, not recorded.
                 st.button("Mark refunded", key=f"sarefd{b['id']}", on_click=_mark_refunded_click,
                           args=(b["id"], back))
-                if part_refund_applies(b, b["ev_status"], b["refund_rule"]):
+                if part_refund_applies(b, b["ev_status"], b["refund_rule"]) and not told_no_refund(b["id"]):
                     _part_refund_controls(b, back)
     with tabs[2]:
         _admin_payouts(owed)

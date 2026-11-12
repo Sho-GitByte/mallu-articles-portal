@@ -27,18 +27,43 @@
 # at the next report). There is no default. A lift is also tied to what the admin's
 # screen showed: the newest report on the account and the hold reason. If a newer
 # report has come in, or the hold has changed, the lift is refused and the page reloads
-# to show it, and only reports up to the newest one shown are ever closed.
+# to show it with an empty choice — the next click starts over, so a double click or an
+# impatient second click never applies the old choice to reports nobody has read — and
+# only reports up to the newest one shown are ever closed.
+#
+# When a hold is lifted, the account's suspended_reason (unused while it is active)
+# records the newest report the lift covered: "Hold lifted — reports up to #N reviewed".
+# An automatic hold needs an open report newer than that, so reports the team reviewed
+# and left open keep counting, but only a new report puts the account back on hold.
 #
 # Every state change here is a single conditional statement (… WHERE NOT EXISTS / WHERE
 # status='open' … RETURNING id), so a double click or two admins on the same row can
 # never close a report twice or send the same message twice. Within one process the
 # store's connection lock also makes the WHERE NOT EXISTS inserts single-shot; across
 # several workers on Postgres that needs the unique indexes described in the notes.
-# The one sequence is the lift: close the reports (each close checks the account is
-# still held as shown), then clear the flag (checked the same way). On Postgres a
-# dropped connection raises rather than resending a write, so it can stop between the
-# two; the account is then still on hold with fewer open reports, and Lift hold works
-# again from there.
+#
+# On Postgres store._run sends a write once and, if the connection drops, raises
+# without knowing whether it committed; nothing here is ever re-run. So each sequence
+# of writes can be finished later from wherever it stopped:
+# - A report, then the automatic hold. If the report is saved and the hold is not,
+#   report_button looks whether the report is in and places the hold before the error
+#   goes up to the page. The hold check also runs again when the Reports page opens and
+#   when a reporter sees their 'Reported' note, so a hold that was missed (the process
+#   died in between) is placed without anyone having to report again.
+# - A lift: claim it (the hold reason becomes "Hold being lifted (ref …)", only if it
+#   still reads as the admin saw it), close the reports as the admin chose, clear the
+#   flag. Every step checks the claim, so a second admin lifting at the same moment is
+#   told someone else is lifting it, and the reports are closed one way only. A lift
+#   that stops part-way leaves the account on hold under the claim, and Lift hold works
+#   again from there. After the flag is cleared the hold check runs once more, for a
+#   report that was filed while the lift ran (Postgres READ COMMITTED hides it from the
+#   lift, and its own hold check found the account still held).
+# - The WhatsApp messages that follow a change are sent after it. If the process stops
+#   in between they are not sent again; the change itself stands.
+
+import re
+import secrets
+from contextlib import suppress
 
 import streamlit as st
 
@@ -77,6 +102,13 @@ _LIFT_CHOICES = {
     "resolved": "They were genuine and are handled — resolve them",
     "open": "Leave the reports open",
 }
+
+# What users.suspended_reason holds while a lift is under way: the claim (a fresh ref
+# each time, so two admins can never both hold it) and the reason the hold was placed,
+# which goes back if the lift is refused part-way. The held member can see it.
+_LIFTING_RE = re.compile(r"^Hold being lifted \(ref [0-9a-f]+\)\. Reason it was placed: (.*)$", re.DOTALL)
+# And once the hold is lifted: the newest report the lift covered (see _maybe_suspend).
+_LIFTED_RE = re.compile(r"^Hold lifted — reports up to #(\d+) reviewed")
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -180,6 +212,30 @@ def _suspended_by_id(user_id):
     return bool(rows) and _flag(rows[0]["suspended"])
 
 
+def _held_for(reason):
+    """The reason a hold was placed, without a lift's claim around it."""
+    m = _LIFTING_RE.match(reason or "")
+    return m.group(1) if m else (reason or "")
+
+
+def _lifting_mark(held_for):
+    return f"Hold being lifted (ref {secrets.token_hex(4)}). Reason it was placed: {held_for}"
+
+
+def _lifted_mark(seen_report_id, admin_id):
+    # Who and when, too: if the connection drops as the flag is cleared, the team's
+    # "Hold lifted" message is never sent, and this is the only record of the lift.
+    return (f"Hold lifted — reports up to #{int(seen_report_id or 0)} reviewed "
+            f"(admin #{admin_id}, {now_iso()})")
+
+
+def _lifted_upto(reason):
+    """The newest report the last lift covered, from an active account's suspended_reason;
+    0 when it was never lifted (or was lifted before this was recorded)."""
+    m = _LIFTED_RE.match(reason or "")
+    return int(m.group(1)) if m else 0
+
+
 def is_suspended(user_or_row):
     """True when the account is on hold. Takes a user dict, a users row, a user id or a
     numeric string.
@@ -263,18 +319,35 @@ def _counting_reporters(target_user_id):
 
 def _maybe_suspend(target_user_id):
     """Put the account on hold once REPORTS_TO_SUSPEND different reporters in good
-    standing have open reports against it. Only the request that flips the flag sends
-    the messages."""
+    standing have open reports against it and at least one open report is newer than
+    the last lift (see _lifted_upto). Only the request that flips the flag sends the
+    messages.
+
+    Safe to call at any time, and it is called more than once: after a report is filed,
+    after a lift, when the Reports page opens and when a reporter sees their 'Reported'
+    note. That is what places a hold that was missed because a report was saved and the
+    connection dropped (or the process died) before this ran. The newer-than-the-lift
+    rule keeps those calls from undoing a lift that left the reports open: the team
+    reviewed those, and only a new report puts the account back on hold."""
     if target_user_id is None:
         return False
+    rows = q("SELECT suspended, suspended_reason FROM users WHERE id=?", (target_user_id,))
+    if not rows or _flag(rows[0]["suspended"]):
+        return False
+    was = rows[0]["suspended_reason"] or ""
     n = len(_counting_reporters(target_user_id))
     if n < REPORTS_TO_SUSPEND:
         return False
     reason = (f"On hold automatically: {n} different people reported this account. "
               "The GharSe team is reviewing.")
+    # The reason read above is part of the check, so a lift that commits in between
+    # (writing a newer "reports up to #N") makes this match nothing.
     flipped = execute("UPDATE users SET suspended=1, suspended_reason=? "
-                      "WHERE id=? AND COALESCE(suspended,0)=0 AND role!='admin' RETURNING id",
-                      (reason, target_user_id))
+                      "WHERE id=? AND COALESCE(suspended,0)=0 AND role!='admin' "
+                      "AND COALESCE(suspended_reason,'')=? "
+                      "AND EXISTS (SELECT 1 FROM reports WHERE target_user_id=? AND status='open' "
+                      "AND id>?) RETURNING id",
+                      (reason, target_user_id, was, target_user_id, _lifted_upto(was)))
     if flipped is None:
         return False
     who = _person(target_user_id)
@@ -302,6 +375,12 @@ def _file_report(reporter_id, target_kind, target_id, target_user_id, reason, de
          reporter_id, target_kind, target_id))
 
 
+def _has_open_report(reporter_id, target_kind, target_id):
+    return bool(q("SELECT 1 FROM reports WHERE reporter_user_id=? AND target_kind=? "
+                  "AND COALESCE(target_id,-1)=COALESCE(?,-1) AND status='open'",
+                  (reporter_id, target_kind, target_id)))
+
+
 def report_button(reporter, target_kind, target_id, target_user_id, key):
     """A small Report control for anything on GharSe — an event, a room, a profile.
 
@@ -309,7 +388,12 @@ def report_button(reporter, target_kind, target_id, target_user_id, key):
     REPORTS_TO_SUSPEND different reporters in good standing (see _counting_reports)
     have open reports against the same account it goes on hold until the team reviews
     it. A held account can still report — the team must hear complaints — but its
-    reports never count toward holding anyone."""
+    reports never count toward holding anyone.
+
+    Filing the report and placing the hold are two writes. If the first is saved and
+    the connection drops before the second, the error still goes up to the page, but
+    the hold is placed first; and the 'Reported' note this reporter sees from then on
+    checks for a missed hold too, since they cannot report again."""
     rid = _uid(reporter)
     tuid = _uid(target_user_id)
     if rid is None or (tuid is not None and rid == tuid):
@@ -318,10 +402,14 @@ def report_button(reporter, target_kind, target_id, target_user_id, key):
     if st.session_state.get(flash_key):
         _flash(flash_key)
         return
-    open_already = q("SELECT 1 FROM reports WHERE reporter_user_id=? AND target_kind=? "
-                     "AND COALESCE(target_id,-1)=COALESCE(?,-1) AND status='open'",
-                     (rid, target_kind, target_id))
-    if open_already:
+    if _has_open_report(rid, target_kind, target_id):
+        # Their report is in. If it completed a hold that was never placed, place it now —
+        # once per session for this account: the check counts every report on it, and this
+        # note is drawn on every rerun of the pages that show it.
+        checked = st.session_state.setdefault("safety_hold_checked", set())
+        if tuid not in checked:
+            _maybe_suspend(tuid)
+            checked.add(tuid)
         st.markdown("<span class='pill flat'>Reported</span> <span class='muted'>The GharSe team "
                     "has your report and is looking into it.</span>", unsafe_allow_html=True)
         return
@@ -334,8 +422,18 @@ def report_button(reporter, target_kind, target_id, target_user_id, key):
                                    placeholder="When it happened and what was said or done.")
             sent = st.form_submit_button("Send report", type="primary")
         if sent:
-            new_id = _file_report(rid, target_kind, target_id, tuid, reason,
-                                  (details or "").strip() or None)
+            try:
+                new_id = _file_report(rid, target_kind, target_id, tuid, reason,
+                                      (details or "").strip() or None)
+            except Exception:
+                # The INSERT may have committed before the connection went (store._run
+                # raises rather than send a write twice). Reads are retried, so look: if
+                # the report is in, place the hold it may complete before the error goes
+                # up. If this fails too, the 'Reported' note and the Reports page place it.
+                with suppress(Exception):
+                    if tuid is not None and _has_open_report(rid, target_kind, target_id):
+                        _maybe_suspend(tuid)
+                raise
             if new_id is None:
                 st.session_state[flash_key] = "You've already reported this — the team has it."
             else:
@@ -535,10 +633,11 @@ def _close_all_for(target_user_id, status, admin_id, seen_report_id, seen_reason
     newest one the admin was shown), one atomic close each, and tell each reporter once.
     Returns how many reports this call closed.
 
-    Each close also checks that the account is still on hold (with the reason shown,
-    unless seen_reason is None) and that no report newer than the ones shown is open, so
-    a lift from a stale screen closes nothing, and a report the admin never saw is never
-    closed by it."""
+    Each close also checks that the account is still on hold with that reason (unless
+    seen_reason is None) and that no report newer than the ones shown is open, so a lift
+    from a stale screen closes nothing, and a report the admin never saw is never closed
+    by it. _unsuspend passes its claim as seen_reason, so once another admin has taken
+    the lift over, this one closes nothing more."""
     seen = int(seen_report_id or 0)
     told, closed = set(), 0
     for r in q("SELECT id, reporter_user_id, created_at FROM reports "
@@ -587,50 +686,92 @@ def _unsuspend(target_user_id, note, admin_id, close_as, seen_report_id, seen_re
     """Lift a hold, as the admin saw it. close_as is what the open reports were:
     'dismissed', 'resolved', or None to leave them open. seen_report_id is the newest
     open report the admin's screen showed for the account (None or 0 when it showed
-    none) and seen_reason the hold reason it showed (None skips that check).
+    none) and seen_reason the hold reason it showed (None takes the hold as it reads
+    now, for callers with no screen).
 
-    Returns None when the hold is already lifted or has changed, or a report newer than
-    seen_report_id is open — the admin has not read that one yet. If that was so when it
-    was called nothing changes. The reports are closed first, while the account is still
-    on hold, so a report filed in the meantime cannot re-hold an account whose reports
-    are then all closed; the flag is cleared last, by a statement that checks all of it
-    again. A report that arrives part-way through leaves the reports already closed as
-    the admin chose and the account on hold for the new one."""
+    Returns None when the hold is already lifted or has changed, another admin is
+    lifting it, or a report newer than seen_report_id is open — the admin has not read
+    that one yet. If that was so when it was called nothing changes.
+
+    Three steps, each one conditional statement. First the lift is claimed: the hold
+    reason becomes a fresh "Hold being lifted (ref …)" mark, only while the account is
+    held with the reason shown and nothing newer is open, so of two admins lifting at
+    once exactly one goes on and the reports are closed one way only. Then the reports
+    are closed, while the account is still on hold, so a report filed in the meantime
+    cannot re-hold an account whose reports are then all closed. Then the flag is
+    cleared and the reason becomes "Hold lifted — reports up to #seen reviewed". Each
+    step checks the claim and that nothing newer is open. A report that arrives
+    part-way through leaves the reports already closed as the admin chose and the
+    account on hold for the new one, with its reason given back. A lift that stops
+    part-way (a dropped connection raises; nothing is re-sent) leaves the account on
+    hold under the claim, shown on the page, and Lift hold works again from there."""
     if close_as not in (None, "dismissed", "resolved"):
         raise ValueError(f"close_as must be 'dismissed', 'resolved' or None, not {close_as!r}")
     seen = int(seen_report_id or 0)
-    closed = _close_all_for(target_user_id, close_as, admin_id, seen, seen_reason) if close_as else 0
+    if seen_reason is None:
+        # No reason given to check: claim the hold as it reads now.
+        rows = q("SELECT suspended_reason FROM users WHERE id=?", (target_user_id,))
+        seen_reason = (rows[0]["suspended_reason"] or "") if rows else ""
+    held_for = _held_for(seen_reason)
+    claim = _lifting_mark(held_for)
     # <> 0 rather than = 1, so a hold stored as any other non-zero value can be lifted too.
-    # A report that commits just as this runs, unseen by its NOT EXISTS, is the same as one
-    # filed just after the lift: it stays open on the page and counts toward a new hold.
-    done = execute("UPDATE users SET suspended=0, suspended_reason=NULL "
-                   "WHERE id=? AND COALESCE(suspended,0)<>0 "
-                   "AND (? IS NULL OR COALESCE(suspended_reason,'')=?) "
+    claimed = execute("UPDATE users SET suspended_reason=? "
+                      "WHERE id=? AND COALESCE(suspended,0)<>0 AND COALESCE(suspended_reason,'')=? "
+                      "AND NOT EXISTS (SELECT 1 FROM reports WHERE target_user_id=? AND status='open' "
+                      "AND id>?) RETURNING id",
+                      (claim, target_user_id, seen_reason, target_user_id, seen))
+    if claimed is None:
+        return None
+    closed = _close_all_for(target_user_id, close_as, admin_id, seen, claim) if close_as else 0
+    done = execute("UPDATE users SET suspended=0, suspended_reason=? "
+                   "WHERE id=? AND COALESCE(suspended,0)<>0 AND COALESCE(suspended_reason,'')=? "
                    "AND NOT EXISTS (SELECT 1 FROM reports WHERE target_user_id=? AND status='open' "
                    "AND id>?) RETURNING id",
-                   (target_user_id, seen_reason, seen_reason, target_user_id, seen))
-    if done is not None:
-        _tell_user(target_user_id, "Account active",
-                   "Your GharSe account is active again. " + (f"Note from the team: {note}. " if note else "")
-                   + "Thank you for your patience.")
-        who = _person(target_user_id)
-        reports = (f" Reports {close_as}: {closed}." if close_as else " Open reports left open.")
-        _tell_team("Hold lifted",
-                   f"{_admin_handle(admin_id)} lifted the hold on @{who['username']} (account "
-                   f"#{target_user_id})." + reports + (f" Note: {note}" if note else ""),
-                   ref=target_user_id)
+                   (_lifted_mark(seen, admin_id), target_user_id, claim, target_user_id, seen))
+    if done is None:
+        # A report came in after the claim: the hold stays, with its own reason back
+        # (unless another admin has taken the lift over meanwhile).
+        execute("UPDATE users SET suspended_reason=? WHERE id=? AND COALESCE(suspended,0)<>0 "
+                "AND suspended_reason=? RETURNING id", (held_for, target_user_id, claim))
+        return None
+    _tell_user(target_user_id, "Account active",
+               "Your GharSe account is active again. " + (f"Note from the team: {note}. " if note else "")
+               + "Thank you for your patience.")
+    who = _person(target_user_id)
+    left = (q("SELECT COUNT(*) c FROM reports WHERE target_user_id=? AND status='open' AND id<=?",
+              (target_user_id, seen))[0]["c"] if seen and not close_as else 0)
+    if seen and close_as:
+        reports = f" Reports {close_as}: {closed}."
+    elif left:
+        reports = " Open reports left open."
+    else:
+        reports = " No open reports."
+    _tell_team("Hold lifted",
+               f"{_admin_handle(admin_id)} lifted the hold on @{who['username']} (account "
+               f"#{target_user_id})." + reports + (f" Note: {note}" if note else ""),
+               ref=target_user_id)
+    # A report that committed while the flag was being cleared is hidden from that
+    # statement's NOT EXISTS (Postgres READ COMMITTED), and its own hold check found the
+    # account still held. Now the lift has committed, check for it: with reports left
+    # open, that report is "the next report" the form said would re-hold the account.
+    if q("SELECT 1 FROM reports WHERE target_user_id=? AND status='open' AND id>?",
+         (target_user_id, seen)):
+        _maybe_suspend(target_user_id)
     return done
 
 
 def _lift_refused(target_user_id, seen_report_id):
     """Why _unsuspend refused, for the message on the page — read afterwards, since the
     refusal itself is one statement that says only no."""
-    rows = q("SELECT suspended FROM users WHERE id=?", (target_user_id,))
+    rows = q("SELECT suspended, suspended_reason FROM users WHERE id=?", (target_user_id,))
     if not rows or not _flag(rows[0]["suspended"]):
         return "That hold was already lifted."
     if q("SELECT 1 FROM reports WHERE target_user_id=? AND status='open' AND id>?",
          (target_user_id, int(seen_report_id or 0))):
         return "New reports arrived — reload and review them. The hold is still on."
+    if _LIFTING_RE.match(rows[0]["suspended_reason"] or ""):
+        return ("Another admin is lifting this hold right now. Reload in a moment — if it is "
+                "still on hold then, review it and lift it again. The hold is still on.")
     return "This account's hold changed after the page loaded — review it again. The hold is still on."
 
 
@@ -647,36 +788,58 @@ def _lift_captions(counting_people):
             left_open]
 
 
+def _lift_clicked(key, attempt):
+    """on_click of Lift hold. Callbacks run before the page is drawn, from what the last
+    run drew, so this is called even when the click arrives after its card has gone —
+    admin_reports then says so instead of the click vanishing."""
+    st.session_state["rep_lift_click"] = (key, attempt)
+
+
 def _hold_controls(acct, admin_id, key, newest_report_id=0, counting_people=0):
     """Suspend / lift controls for one account. newest_report_id is the newest open
     report on the account this screen shows (0 for none) and counting_people how many
     of its reporters count toward an automatic hold. Lift hold is checked against what
     the screen showed, so a click on a stale screen is refused instead of lifting a hold
-    or closing reports the admin never saw."""
+    or closing reports the admin never saw.
+
+    Every handled Lift hold click starts the next one over: the form and the choice
+    carry an attempt number in their keys, bumped on each click that reaches a decision.
+    After a refusal the page reloads with the choice empty, and the second half of a
+    double click — sent from the form that was just answered, with the old choice —
+    matches no form on the page and does nothing."""
     if acct["role"] == "admin":
         st.caption("Admin accounts can't be put on hold here.")
         return
     if acct["suspended"]:
-        seen_key = f"{key}_lift_seen"
+        seen_key, try_key = f"{key}_lift_seen", f"{key}_lift_try"
         # A click is handled on the run after the one that drew the form, so what the
         # admin saw is what the previous run recorded. Read it before this run replaces it.
         seen = st.session_state.get(seen_key)
+        attempt = st.session_state.get(try_key, 0)
         choice = None
-        with st.form(f"{key}_lift", border=False):
+        if _LIFTING_RE.match(acct["suspended_reason"] or ""):
+            st.caption("A lift of this hold started and hasn't finished — another admin may be "
+                       "lifting it right now. If it's still here after a reload, lift it again "
+                       "to finish it.")
+        with st.form(f"{key}_lift_{attempt}", border=False):
             note = st.text_input("Note to them (optional)", key=f"{key}_lift_note",
                                  placeholder="e.g. We spoke to everyone involved.")
             if newest_report_id:
                 choice = st.radio("Their open reports", list(_LIFT_CHOICES), index=None,
-                                  format_func=_LIFT_CHOICES.get,
-                                  captions=_lift_captions(counting_people), key=f"{key}_lift_reports")
+                                  format_func=_LIFT_CHOICES.get, captions=_lift_captions(counting_people),
+                                  key=f"{key}_lift_reports_{attempt}")
             else:
                 st.caption("No open reports on this account.")
-            lift = st.form_submit_button("Lift hold")
+            lift = st.form_submit_button("Lift hold", on_click=_lift_clicked, args=(key, attempt))
         st.session_state[seen_key] = (int(newest_report_id or 0), acct["suspended_reason"] or "")
+        if (st.session_state.get("rep_lift_click") or ("",))[0] == key:
+            # This card is here to answer the click (or it was sent from an older form).
+            st.session_state.pop("rep_lift_click", None)
         if lift:
             if newest_report_id and choice is None:
                 st.error("Choose what happens to their open reports before you lift the hold.")
                 return
+            st.session_state[try_key] = attempt + 1
             if seen is None:
                 st.session_state["rep_warn"] = ("This page had to reload — review the account again "
                                                 "before you lift the hold.")
@@ -687,8 +850,10 @@ def _hold_controls(acct, admin_id, key, newest_report_id=0, counting_people=0):
                 st.session_state["rep_warn"] = _lift_refused(acct["id"], seen_id)
             elif q("SELECT 1 FROM reports WHERE target_user_id=? AND status='open' AND id>?",
                    (acct["id"], seen_id)):
-                st.session_state["rep_flash"] = ("Hold lifted and they've been told. A new report came "
-                                                 "in as you lifted it — it's open on this page.")
+                st.session_state["rep_flash"] = (
+                    "Hold lifted and they've been told. A new report came in as you lifted it — it's "
+                    "open on this page" + (", and it has put the account back on hold."
+                                           if _suspended_by_id(acct["id"]) else "."))
             else:
                 st.session_state["rep_flash"] = "Hold lifted and they've been told."
             st.rerun()
@@ -708,6 +873,8 @@ def _hold_controls(acct, admin_id, key, newest_report_id=0, counting_people=0):
 
 
 def admin_reports(admin_user):
+    """The team's Reports page. Opening it also places any automatic hold that is due
+    but was never placed (see _maybe_suspend), before anything is drawn."""
     if _get(admin_user, "role") != "admin":
         st.error("Only the GharSe team can open this page.")
         return
@@ -716,8 +883,24 @@ def admin_reports(admin_user):
                 "needs no action, resolve what you've handled, and hold accounts that aren't safe.</div>",
                 unsafe_allow_html=True)
     admin_id = _uid(admin_user)
+    rows = q("SELECT r.*, ru.username reporter FROM reports r "
+             "LEFT JOIN users ru ON ru.id = r.reporter_user_id "
+             "WHERE r.status='open' ORDER BY r.target_user_id, r.id")
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["target_user_id"], []).append(dict(r))
+    # {report id: reporter id} for the reports that count, per account; the hold needs
+    # REPORTS_TO_SUSPEND people.
+    counting_by = {tuid: _counting_reports(tuid) for tuid in groups}
+    # A hold the reports earned that was never placed — the report was saved, then the
+    # connection dropped or the process died before the hold — is placed now.
+    placed = [tuid for tuid, counting in counting_by.items()
+              if len(set(counting.values())) >= REPORTS_TO_SUSPEND and _maybe_suspend(tuid)]
     _flash("rep_flash")
     _flash("rep_warn", st.warning)
+    for tuid in placed:
+        st.warning(f"Account #{tuid} has been put on hold just now: enough people who count had "
+                   "reported it, but the hold had not been placed. Review it below.")
     st.markdown(grievance_line(), unsafe_allow_html=True)
 
     n_open = q("SELECT COUNT(*) c FROM reports WHERE status='open'")[0]["c"]
@@ -731,23 +914,15 @@ def admin_reports(admin_user):
     st.write("")
 
     st.markdown("#### Open reports")
-    rows = q("SELECT r.*, ru.username reporter FROM reports r "
-             "LEFT JOIN users ru ON ru.id = r.reporter_user_id "
-             "WHERE r.status='open' ORDER BY r.target_user_id, r.id")
     if not rows:
         st.caption("No open reports. Anything people report appears here.")
-    groups = {}
-    for r in rows:
-        groups.setdefault(r["target_user_id"], []).append(dict(r))
     # Most-reported first.
     order = sorted(groups, key=lambda t: (-len({x["reporter_user_id"] for x in groups[t]}),
                                           groups[t][0]["id"]))
-    counting_by = {}
     for tuid in order:
         reps = groups[tuid]
         people = len({x["reporter_user_id"] for x in reps})
-        # {report id: reporter id} for the reports that count; the hold needs that many people.
-        counting = counting_by[tuid] = _counting_reports(tuid)
+        counting = counting_by[tuid]
         n_counting = len(set(counting.values()))
         acct = None
         if tuid is not None:
@@ -820,6 +995,18 @@ def admin_reports(admin_user):
             _hold_controls(acct, admin_id, f"rep_held_{acct['id']}",
                            max((x["id"] for x in reps), default=0),
                            len(set((counting_by.get(acct["id"]) or {}).values())))
+
+    # A Lift hold click whose form was not drawn this time — the hold was lifted, or the
+    # card's reports were closed, before the click arrived — would otherwise do nothing
+    # without a word. One sent from an older form of a card (the second half of a double
+    # click after the first was answered) is dropped quietly: the first click's message
+    # already says what happened.
+    missed = st.session_state.pop("rep_lift_click", None)
+    if missed and missed[1] >= st.session_state.get(f"{missed[0]}_lift_try", 0):
+        st.session_state["rep_warn"] = ("Nothing was changed — that account's card had changed before "
+                                        "your Lift hold click arrived (the hold may already have been "
+                                        "lifted). Check it again below.")
+        st.rerun()
 
     st.markdown("#### Recently closed")
     closed = q("SELECT r.resolved_at, r.status, r.reason, r.target_kind, r.target_id, "
